@@ -1,0 +1,56 @@
+model:
+  target_model_path: /kl_infra_infer_intern/wangzhuoyu/TAPS-SP/models/Qwen3-4B
+  draft_model_config: configs/qwen3-4b-pspr.json
+  draft_checkpoint_path: /kl_infra_infer_intern/wangzhuoyu/TAPS-SP/models/Qwen3-4B-DFlash-b16
+  embedding_key: model.embed_tokens.weight
+  torch_dtype: bfloat16
+
+data:
+  hidden_states_path: ./cache/hidden_states/sharegpt3k
+  max_length: 3072
+  chat_template: qwen
+  cache_dir: ./cache
+
+training:
+  strategy: dflash
+  num_epochs: 6
+  # Per *device*: refs are sharded by DP rank first, then batched. 8 x 2 = 16 global, so an epoch is
+  # ~187 optimizer steps and the run is ~1122 -- against 8961 on one GPU at the same 6 epochs.
+  batch_size: 2
+  # Raised from 3.0e-4 for the 8x larger global batch. sqrt scaling (x2.83 -> 8.5e-4) rather than
+  # linear (x8 -> 2.4e-3): the selector is a 27M head containing a GRU and a 3-layer encoder, and
+  # the linear rule is a poor fit for Adam at this width.
+  learning_rate: 8.5e-4
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  attention_backend: flex_attention
+  num_anchors: 256
+  # null == uniform CE over the block. The reference selector that measured 5.705 trained with
+  # uniform position weights; both alternatives were measured and lost on the same backbone and
+  # data (D-PACE +0.286, frontier down-weighting with wrong_w=3 +0.355, vs +0.440 uniform).
+  loss_decay_gamma: null
+  dflash2_selector_loss_alpha: 1.0
+  dflash2_selector_err_loss_alpha: 1.0
+  dflash2_selector_own_denominator: true
+  dflash2_selector_warmup_ratio: 0.0
+  dflash2_selector_ramp_ratio: 0.0
+  dflash2_selector_stop_gradient: true
+  # Supervise the selector with the target's own greedy token. 22.1% of supervised ShareGPT
+  # positions carry a corpus label the target would never emit, and at those positions the corpus
+  # label is an instruction to overrule a base top-1 that decode would have accepted -- measured as
+  # destroy 294 vs recover 84 on gsm8k. Needs cache/hidden_states/sharegpt3k.target_greedy.
+  dflash2_selector_target_greedy_labels: true
+  # Must stay well under the total step count or the run keeps no intermediate checkpoint at all.
+  save_interval: 200
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+
+run_id: qwen3-4b-pspr-frozen
+output_dir: ./outputs/qwen3-4b-pspr-frozen
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8

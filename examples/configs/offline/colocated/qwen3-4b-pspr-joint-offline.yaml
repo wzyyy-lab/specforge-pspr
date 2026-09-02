@@ -1,0 +1,89 @@
+model:
+  target_model_path: /kl_infra_infer_intern/wangzhuoyu/TAPS-SP/models/Qwen3-4B
+  draft_model_config: configs/qwen3-4b-pspr-joint.json
+  # Stage 2 starts from the stage-1 selector fused onto the released DFlash backbone. Build it with
+  #   PYTHONPATH=. python scripts/import_pspr_selector.py \
+  #       --selector outputs/pspr_dh2048_exact/best.pt --output-dir outputs/pspr_joint_init
+  # A randomly initialised selector produces no useful gradient for the backbone, so training both
+  # from scratch spends the backbone's budget being dragged by a head that has not learned yet.
+  draft_checkpoint_path: ./outputs/pspr_joint_init
+  embedding_key: model.embed_tokens.weight
+  torch_dtype: bfloat16
+
+data:
+  hidden_states_path: ./cache/hidden_states/sharegpt3k
+  max_length: 3072
+  chat_template: qwen
+  cache_dir: ./cache
+
+training:
+  strategy: dflash
+  num_epochs: 3
+  # Per device; 8 x 2 = 16 global.
+  batch_size: 2
+  # sqrt-scaled from 1.0e-4 for the 8x larger global batch, same reasoning as stage 1.
+  learning_rate: 2.8e-4
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  attention_backend: flex_attention
+  num_anchors: 256
+  loss_decay_gamma: null
+
+  # --- Optimizer, matching the dh2048 recipe (TAPS-SP/scripts/train_accept_selector.py) ---------
+  # AdamW there decays everything at 2e-3 except `gamma`, which gets its own group at 5x the rate
+  # with no decay at all.
+  weight_decay: 2.0e-3
+  lr_scale_rules:
+    # Longest matching prefix wins, so these are ordered specific -> general.
+    #
+    # dh2048's second AdamW group. `gamma` starts at 0 and must reach ~1 before the head changes any
+    # decision at all, so at the shared rate it is the slowest parameter in the model.
+    "candidate_selector.gamma": 5.0
+    # The rest of the selector trains at the configured rate.
+    "candidate_selector.": 1.0
+    # Empty prefix = everything else = the backbone, which is a released, fully trained model and
+    # must move far more slowly than the head. Written as a catch-all on purpose: PSPRDraftModel's
+    # backbone parameters are named `layers.*`, `norm.*`, `fc.*`, `hidden_norm.*` with NO `model.`
+    # prefix, and `lm_head` does not exist at all because the config ties word embeddings. A rule
+    # like {"model.": 0.05} silently matches nothing and leaves the backbone at the full rate.
+    "": 0.05
+  weight_decay_rules:
+    # dh2048 exempts `gamma` from decay: decay on a single gain that starts at zero pulls it back
+    # toward the no-op point.
+    "candidate_selector.gamma": 0.0
+    # The DFlash2 transition codebooks are embedding tables: one predecessor row and K successor
+    # rows are read per slot, but AdamW applies decay to the WHOLE tensor every step, which would
+    # shrink the vectors of every token absent from the batch. Standard embedding treatment.
+    "candidate_selector.predecessor_codebook": 0.0
+    "candidate_selector.successor_codebook": 0.0
+
+  # --- Selector objective, matching the dh2048 loss --------------------------------------------
+  # dh2048: loss = 1.0 * CE(sc[ti>=0], ti[ti>=0]) + 1.0 * BCE(err_logits[frontier], ti != 0)
+  dflash2_selector_loss_alpha: 1.0
+  dflash2_selector_err_loss_alpha: 1.0
+  # Average the selector CE over covered slots, which is what turns it into a plain mean CE over
+  # {supervised slots whose target is in the top-k} -- exactly dh2048's `CE(sc[m], ti[m])`.
+  dflash2_selector_own_denominator: true
+  dflash2_selector_warmup_ratio: 0.0
+  dflash2_selector_ramp_ratio: 0.0
+  # MUST be false for joint training: stopping the gradient at the unary/backbone boundary is what
+  # makes the selector objective invisible to the backbone, which would leave the two decoupled.
+  dflash2_selector_stop_gradient: false
+  # dh2048 supervises the selector on `g_block`, the committed continuation, which the offline path
+  # represents with the corpus labels. The target-greedy sidecar is a different label definition and
+  # is not part of the recipe, so it stays off.
+  dflash2_selector_target_greedy_labels: false
+
+  save_interval: 150
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+
+run_id: qwen3-4b-pspr-joint
+output_dir: ./outputs/qwen3-4b-pspr-joint
+
+deployment:
+  mode: local_colocated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 8
