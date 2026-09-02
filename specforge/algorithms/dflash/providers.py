@@ -10,6 +10,7 @@ from specforge.algorithms.common.defaults import (
 )
 from specforge.algorithms.common.hidden_states_data import (
     NORMALIZER_ID,
+    TARGET_GREEDY_KEY,
     build_collator,
     build_offline_normalizer,
     build_offline_reader,
@@ -39,8 +40,9 @@ from specforge.data.loss_mask import has_consecutive_supervised_tokens
 ALGORITHM_NAME = "dflash"
 DRAFT_ARCHITECTURE = "DFlashDraftModel"
 DFLASH2_DRAFT_ARCHITECTURE = "DFlash2DraftModel"
+PSPR_DRAFT_ARCHITECTURE = "PSPRDraftModel"
 COMPATIBLE_DRAFT_ARCHITECTURES = frozenset(
-    {DRAFT_ARCHITECTURE, DFLASH2_DRAFT_ARCHITECTURE}
+    {DRAFT_ARCHITECTURE, DFLASH2_DRAFT_ARCHITECTURE, PSPR_DRAFT_ARCHITECTURE}
 )
 
 
@@ -72,14 +74,28 @@ def resume_contract(_config, draft_model, training_model):
     }
     if getattr(draft_model, "candidate_selector", None) is not None:
         method_config = dict(getattr(draft_model.config, "dflash_config", None) or {})
+        # A candidate selector is an algorithm-level feature; the grouped convolution and the
+        # low-rank transition are specific to DFlash2's architecture. Recording the latter
+        # unconditionally would reject any other selector-bearing architecture.
+        if "conv_kernel_size" in method_config:
+            contract.update(
+                {
+                    "dflash2_conv_kernel_size": int(method_config["conv_kernel_size"]),
+                    "dflash2_conv_group_size": int(method_config["conv_group_size"]),
+                    "dflash2_selector_rank": int(method_config["selector_rank"]),
+                }
+            )
         contract.update(
             {
-                "dflash2_conv_kernel_size": int(method_config["conv_kernel_size"]),
-                "dflash2_conv_group_size": int(method_config["conv_group_size"]),
-                "dflash2_selector_rank": int(method_config["selector_rank"]),
                 "dflash2_selector_top_k": int(method_config["selector_top_k"]),
                 "dflash2_selector_loss_alpha": float(
                     training_model.selector_loss_alpha
+                ),
+                "dflash2_selector_err_loss_alpha": float(
+                    training_model.selector_err_loss_alpha
+                ),
+                "dflash2_selector_own_denominator": bool(
+                    training_model.selector_own_denominator
                 ),
                 "dflash2_selector_warmup_ratio": float(
                     training_model.selector_warmup_ratio
@@ -89,6 +105,9 @@ def resume_contract(_config, draft_model, training_model):
                 ),
                 "dflash2_selector_stop_gradient": bool(
                     training_model.selector_stop_gradient
+                ),
+                "dflash2_selector_target_greedy_labels": bool(
+                    training_model.selector_target_greedy_labels
                 ),
             }
         )
@@ -163,6 +182,10 @@ def needs_input_tools(config, draft_model):
 
 def algorithm_spec() -> AlgorithmSpec:
     ready = {"input_ids", "loss_mask", "hidden_states"}
+    # Selector-only supervision, served from a sidecar next to the dump. Optional
+    # because every existing dump predates it and the backbone objective never
+    # reads it.
+    optional = {TARGET_GREEDY_KEY}
     return AlgorithmSpec(
         name=ALGORITHM_NAME,
         draft=DraftRequirement(
@@ -175,9 +198,11 @@ def algorithm_spec() -> AlgorithmSpec:
                 mode=FeatureMode.OFFLINE,
                 modality="text",
                 required_tensors=ready,
+                optional_tensors=optional,
                 storage=OfflineStorageContract(
                     format="specforge_hidden_states_v1",
                     required_tensors=ready,
+                    optional_tensors=optional,
                     normalizer=NORMALIZER_ID,
                 ),
             ),

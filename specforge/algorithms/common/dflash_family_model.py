@@ -36,23 +36,42 @@ _VALID_LK_LOSS_TYPES = {None, "alpha", "lambda", "tv"}
 
 
 class SelectorTerms(NamedTuple):
-    """Additive selector objective and metric terms for one objective chunk."""
+    """Additive selector objective and metric terms for one objective chunk.
+
+    The three ``err_*`` fields carry the optional frontier error-detector objective. They stay zero
+    for selectors that do not declare ``wants_err_objective``, so the DFlash2 selector path reduces
+    to exactly its previous behaviour.
+    """
 
     ce_num: torch.Tensor
     probability_num: torch.Tensor
     correct_num: torch.Tensor
     weight_den: torch.Tensor
     covered_num: torch.Tensor
+    err_ce_num: torch.Tensor
+    err_den: torch.Tensor
+    err_correct_num: torch.Tensor
 
     @classmethod
     def zeros(cls, reference: torch.Tensor) -> "SelectorTerms":
-        return cls(
-            reference.new_zeros(()),
-            reference.new_zeros(()),
-            reference.new_zeros(()),
-            reference.new_zeros(()),
-            reference.new_zeros(()),
-        )
+        return cls(*(reference.new_zeros(()) for _ in cls._fields))
+
+
+def frontier_mask(valid: torch.Tensor, top_ok: torch.Tensor) -> torch.Tensor:
+    """Slots up to AND INCLUDING the first position where the base top-1 is wrong.
+
+    A drafted block's accepted run ends at its first mismatch, so these are the only slots a decode
+    actually reaches, and therefore the only slots at which a repair decision is ever taken.
+    Operates on the last dimension, which is the within-block slot axis.
+    """
+
+    reached = torch.cumsum(((~valid) | (~top_ok)).long(), dim=-1) == 0
+    run_length = reached.sum(dim=-1, keepdim=True)
+    horizon = valid.shape[-1]
+    first_error = torch.zeros_like(reached).scatter(
+        -1, run_length.clamp(max=horizon - 1), run_length < horizon
+    )
+    return (reached | first_error) & valid
 
 
 class DFlashObjectiveTerms(NamedTuple):
@@ -75,6 +94,9 @@ class DFlashObjectiveTerms(NamedTuple):
     selector_correct_num: torch.Tensor
     selector_weight_den: torch.Tensor
     selector_covered_num: torch.Tensor
+    selector_err_ce_num: torch.Tensor
+    selector_err_den: torch.Tensor
+    selector_err_correct_num: torch.Tensor
 
 
 def compute_accept_len(
@@ -210,9 +232,12 @@ class OnlineDFlashModel(nn.Module):
         loss_type: str = "dflash",
         dpace_alpha: float = 0.5,
         selector_loss_alpha: float = 1.0,
+        selector_err_loss_alpha: float = 0.0,
+        selector_own_denominator: bool = False,
         selector_warmup_ratio: float = 0.0,
         selector_ramp_ratio: float = 0.0,
         selector_stop_gradient: bool = False,
+        selector_target_greedy_labels: bool = False,
         lk_loss_type: Optional[str] = None,
         kl_scale: float = 1.0,
         kl_decay: float = 1.0,
@@ -228,6 +253,8 @@ class OnlineDFlashModel(nn.Module):
             raise ValueError("objective_chunk_blocks must be >= 0")
         if selector_loss_alpha < 0:
             raise ValueError("selector_loss_alpha must be >= 0")
+        if selector_err_loss_alpha < 0:
+            raise ValueError("selector_err_loss_alpha must be >= 0")
         if not 0.0 <= selector_warmup_ratio <= 1.0:
             raise ValueError("selector_warmup_ratio must be in [0, 1]")
         if not 0.0 <= selector_ramp_ratio <= 1.0:
@@ -249,9 +276,12 @@ class OnlineDFlashModel(nn.Module):
         self.loss_type = loss_type
         self.dpace_alpha = dpace_alpha
         self.selector_loss_alpha = float(selector_loss_alpha)
+        self.selector_err_loss_alpha = float(selector_err_loss_alpha)
+        self.selector_own_denominator = bool(selector_own_denominator)
         self.selector_warmup_ratio = float(selector_warmup_ratio)
         self.selector_ramp_ratio = float(selector_ramp_ratio)
         self.selector_stop_gradient = bool(selector_stop_gradient)
+        self.selector_target_greedy_labels = bool(selector_target_greedy_labels)
         self.lk_loss_type = lk_loss_type
         self.kl_scale = float(kl_scale)
         self.kl_decay = float(kl_decay)
@@ -259,6 +289,14 @@ class OnlineDFlashModel(nn.Module):
         candidate_selector = getattr(self.draft_model, "candidate_selector", None)
         self._selector_objective_enabled = (
             candidate_selector is not None and self.selector_loss_alpha > 0
+        )
+        # Static, like the CE gate above: the detector's parameters must either be trained for the
+        # whole run or frozen for the whole run, never toggled per step, or DDP with
+        # ``find_unused_parameters=False`` would stall on the steps that skip them.
+        self._selector_err_objective_enabled = (
+            self._selector_objective_enabled
+            and bool(getattr(candidate_selector, "wants_err_objective", False))
+            and self.selector_err_loss_alpha > 0
         )
         if (
             candidate_selector is not None
@@ -269,6 +307,16 @@ class OnlineDFlashModel(nn.Module):
             # Freezing keeps those parameters out of BF16Optimizer and prevents
             # DDP(find_unused_parameters=False) from waiting for their gradients.
             candidate_selector.requires_grad_(False)
+        if (
+            candidate_selector is not None
+            and bool(getattr(candidate_selector, "wants_err_objective", False))
+            and not self._selector_err_objective_enabled
+        ):
+            # Same reason, one level down: a selector may be trained while its optional detector is
+            # not, which would otherwise leave a gradient-less subtree in the DDP bucket.
+            err_head = getattr(candidate_selector, "err_head", None)
+            if isinstance(err_head, nn.Module):
+                err_head.requires_grad_(False)
 
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
@@ -475,6 +523,7 @@ class OnlineDFlashModel(nn.Module):
         predecessor_ids: torch.Tensor,
         loss_weights: torch.Tensor,
         weight_mask: torch.Tensor,
+        selector_target_ids: Optional[torch.Tensor] = None,
     ) -> SelectorTerms:
         """Return additive selector terms for one enabled objective chunk.
 
@@ -484,7 +533,17 @@ class OnlineDFlashModel(nn.Module):
         with ``find_unused_parameters=False`` observes every selector parameter.
         The caller flattens these fields into ``DFlashObjectiveTerms`` to preserve
         ``checkpointed_chunk_reduce``'s flat tuple contract.
+
+        ``selector_target_ids`` optionally replaces the corpus labels with the
+        target model's own greedy token for the *same* conditioning prefix. Only
+        the labels move: ``predecessor_ids`` stays on the corpus because that is
+        what the target was conditioned on when the greedy token was computed, so
+        the (prefix, label) pair remains self-consistent and matches the decode
+        acceptance test ``pick == argmax P(. | committed prefix)``.
         """
+
+        if selector_target_ids is None:
+            selector_target_ids = target_ids
 
         if self.selector_stop_gradient:
             # Isolate only the selector objective. The caller still uses the
@@ -495,24 +554,40 @@ class OnlineDFlashModel(nn.Module):
         # Match serving exactly: train only against the strict unary top-k.
         # Candidate misses are a backbone/recall failure, not a selector
         # classification example, so they carry no selector gradient.
-        unary_logits, candidate_ids = objective_logits.topk(
-            candidate_selector.top_k,
-            dim=-1,
-        )
-        target_matches = candidate_ids.eq(target_ids.unsqueeze(-1))
+        if hasattr(candidate_selector, "extract_lattice"):
+            # Selectors that consume full-vocab uncertainty statistics, or that need candidate 0 to
+            # be the argmax token under bf16 logit ties, own their own lattice extraction.
+            unary_logits, candidate_ids, lattice_scalars = (
+                candidate_selector.extract_lattice(objective_logits)
+            )
+            selector_extras = {"lattice_scalars": lattice_scalars}
+        else:
+            unary_logits, candidate_ids = objective_logits.topk(
+                candidate_selector.top_k,
+                dim=-1,
+            )
+            selector_extras = {}
+        target_matches = candidate_ids.eq(selector_target_ids.unsqueeze(-1))
         target_is_candidate = target_matches.any(dim=-1)
         target_candidate_index = target_matches.long().argmax(dim=-1)
-        selector_logits = candidate_selector.score_candidates(
+        wants_err = self._selector_err_objective_enabled
+        if wants_err:
+            selector_extras["return_err"] = True
+        selector_output = candidate_selector.score_candidates(
             candidate_ids=candidate_ids,
             unary_logits=unary_logits,
             hidden_states=hidden,
             predecessor_ids=predecessor_ids,
+            **selector_extras,
+        )
+        selector_logits, err_logits = (
+            selector_output if wants_err else (selector_output, None)
         )
         selector_ce = F.cross_entropy(
             selector_logits.float().reshape(-1, selector_logits.shape[-1]),
             target_candidate_index.reshape(-1),
             reduction="none",
-        ).reshape_as(target_ids)
+        ).reshape_as(selector_target_ids)
         selector_probability = torch.exp(-selector_ce)
         selector_loss_weights = loss_weights * target_is_candidate.float()
         selector_metric_mask = weight_mask * target_is_candidate.float()
@@ -526,14 +601,45 @@ class OnlineDFlashModel(nn.Module):
                 selector_logits.argmax(dim=-1, keepdim=True),
             ).squeeze(-1)
             correct_num = (
-                (selected_ids == target_ids).float() * selector_loss_weights
+                (selected_ids == selector_target_ids).float() * selector_loss_weights
             ).sum()
+        err_ce_num = ce_num.new_zeros(())
+        err_den = ce_num.new_zeros(())
+        err_correct_num = ce_num.new_zeros(())
+        if err_logits is not None:
+            base_top1_ok = target_is_candidate & target_candidate_index.eq(0)
+            # The frontier scan must start at slot 1. This objective zeroes ``weight_mask`` at
+            # ``pos_in_block == 0`` unconditionally, and a leading invalid slot would end the
+            # scan before it began, leaving every row's mask empty.
+            reachable = frontier_mask(weight_mask[..., 1:] > 0, base_top1_ok[..., 1:])
+            reachable = torch.cat(
+                [torch.zeros_like(reachable[..., :1]), reachable], dim=-1
+            )
+            # The label is "the base top-1 is wrong here", which deliberately includes slots whose
+            # target falls outside the top-k. Those are unrepairable by the selector, so the CE
+            # above drops them, but their binary label is perfectly well defined and the detector
+            # must flag them: at decode they end the accepted run just the same.
+            err_target = (~base_top1_ok).float()
+            err_weights = reachable.float()
+            err_per_slot = F.binary_cross_entropy_with_logits(
+                err_logits.float(), err_target, reduction="none"
+            )
+            err_ce_num = (err_per_slot * err_weights).sum()
+            err_den = err_weights.sum()
+            with torch.no_grad():
+                err_correct_num = (
+                    ((err_logits.float() > 0).float() == err_target).float()
+                    * err_weights
+                ).sum()
         return SelectorTerms(
             ce_num=ce_num,
             probability_num=probability_num,
             correct_num=correct_num,
             weight_den=weight_den,
             covered_num=covered_num,
+            err_ce_num=err_ce_num,
+            err_den=err_den,
+            err_correct_num=err_correct_num,
         )
 
     def _dflash_objective_chunk_terms(
@@ -542,6 +648,7 @@ class OnlineDFlashModel(nn.Module):
         target_ids: torch.Tensor,
         weight_mask: torch.Tensor,
         predecessor_ids: torch.Tensor,
+        selector_target_ids: Optional[torch.Tensor] = None,
     ) -> DFlashObjectiveTerms:
         """Return a flat tuple of additive objective and metric tensors."""
 
@@ -604,6 +711,7 @@ class OnlineDFlashModel(nn.Module):
                 predecessor_ids=predecessor_ids,
                 loss_weights=loss_weights,
                 weight_mask=weight_mask,
+                selector_target_ids=selector_target_ids,
             )
 
         with torch.no_grad():
@@ -624,6 +732,9 @@ class OnlineDFlashModel(nn.Module):
             selector_correct_num=selector_terms.correct_num,
             selector_weight_den=selector_terms.weight_den,
             selector_covered_num=selector_terms.covered_num,
+            selector_err_ce_num=selector_terms.err_ce_num,
+            selector_err_den=selector_terms.err_den,
+            selector_err_correct_num=selector_terms.err_correct_num,
         )
 
     def _compose_token_objective(
@@ -646,6 +757,44 @@ class OnlineDFlashModel(nn.Module):
             return kl_weight * ce_num + (1.0 - kl_weight) * tv_num
         raise ValueError(f"unknown lk_loss_type {self.lk_loss_type!r}")
 
+    def _selector_target_ids(
+        self,
+        *,
+        target_greedy: Optional[torch.Tensor],
+        safe_label_indices: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """Gather the target model's own greedy token for each supervised slot.
+
+        Alignment. The dump stores ``target_greedy[i] = argmax P(. | tokens[:i+1])``,
+        i.e. the target's prediction *for* position ``i + 1``, so the greedy token
+        at absolute position ``p`` is ``target_greedy[p - 1]``. Slot ``k`` of a
+        block supervises absolute position ``anchor + k``, hence the shift by one
+        against ``safe_label_indices``. Slot 0 is the anchor itself and would read
+        index ``-1``; the objective already zeroes ``weight_mask`` at
+        ``pos_in_block == 0`` unconditionally, so the clamp below only keeps the
+        gather in bounds and never contributes a term.
+
+        Returns ``None`` when the feature is off, which makes the selector fall
+        back to the corpus labels on exactly the same code path as before.
+        """
+
+        if not self.selector_target_greedy_labels:
+            return None
+        if target_greedy is None:
+            raise ValueError(
+                "selector_target_greedy_labels is enabled but the batch carries no "
+                "'target_greedy' tensor. Build the sidecar with "
+                "scripts/dump_target_greedy.py and place it at "
+                "'<hidden_states_dir>.target_greedy'."
+            )
+        greedy = target_greedy.to(torch.long)
+        shifted = (safe_label_indices - 1).clamp_min(0)
+        return torch.gather(
+            greedy.unsqueeze(1).expand(-1, shifted.size(1), -1),
+            2,
+            shifted,
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -653,6 +802,8 @@ class OnlineDFlashModel(nn.Module):
         loss_mask: torch.Tensor,
         max_valid_anchors: Optional[int] = None,
         selector_loss_alpha: Optional[float] = None,
+        selector_err_loss_alpha: Optional[float] = None,
+        target_greedy: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, object]]:
         """Parallel block-wise training forward pass; returns
         (loss, accuracy, metrics) — same shape as Domino's forward."""
@@ -684,6 +835,10 @@ class OnlineDFlashModel(nn.Module):
         predecessor_ids = torch.cat(
             [target_ids[:, :, :1], target_ids[:, :, :-1]],
             dim=-1,
+        )
+        selector_target_ids = self._selector_target_ids(
+            target_greedy=target_greedy,
+            safe_label_indices=safe_label_indices,
         )
 
         # --- Weight mask: block validity * bounds * exclude anchor (pos 0) * loss_mask ---
@@ -720,12 +875,16 @@ class OnlineDFlashModel(nn.Module):
             selector_correct_num,
             selector_weight_den,
             selector_covered_num,
+            selector_err_ce_num,
+            selector_err_den,
+            selector_err_correct_num,
         ) = checkpointed_chunk_reduce(
             self._dflash_objective_chunk_terms,
             hidden_4d,
             target_ids,
             weight_mask,
             predecessor_ids,
+            selector_target_ids,
             chunk_size=self.objective_chunk_blocks,
             dim=1,
         )
@@ -744,14 +903,48 @@ class OnlineDFlashModel(nn.Module):
             raise ValueError("selector_loss_alpha must be >= 0")
         selector_loss_num = loss_num.new_zeros(())
         has_selector_objective = self._selector_objective_enabled
+        loss_denominator = loss_den
         if has_selector_objective:
             # The selector is a categorical distribution over the serving
             # top-k. Keep its proper, calibrated CE independent of the base
             # model's optional LK/TV composition.
             selector_loss_num = selector_ce_num
-            loss_num = loss_num + effective_selector_alpha * selector_loss_num
+            contribution = selector_loss_num
+            if self.selector_own_denominator:
+                # The selector is only supervised where the target is inside the top-k, a strictly
+                # smaller set than the base objective's. Dividing its numerator by the shared
+                # denominator below would therefore scale the term by top-k coverage (~0.62
+                # measured), making the selector's effective weight -- and its ratio to the
+                # detector's -- drift with the backbone's recall. Rescaling here cancels that
+                # division, so the term is a plain mean over covered slots as in the reference.
+                covered_floor = torch.finfo(selector_weight_den.dtype).tiny
+                contribution = (
+                    selector_ce_num / selector_weight_den.clamp_min(covered_floor)
+                ) * loss_denominator
+            loss_num = loss_num + effective_selector_alpha * contribution
 
-        loss_denominator = loss_den
+        selector_err_loss_num = loss_num.new_zeros(())
+        effective_err_alpha = (
+            self.selector_err_loss_alpha
+            if selector_err_loss_alpha is None
+            else float(selector_err_loss_alpha)
+        )
+        if effective_err_alpha < 0:
+            raise ValueError("selector_err_loss_alpha must be >= 0")
+        if self._selector_err_objective_enabled:
+            # The detector is a binary problem over frontier-reachable slots only, a strictly
+            # smaller set than the CE's, so it owns its denominator. Multiplying by the shared
+            # denominator here cancels the division below, which keeps this term a plain mean over
+            # frontier slots -- matching the reference implementation -- instead of silently
+            # rescaling it by frontier coverage.
+            err_floor = torch.finfo(selector_err_den.dtype).tiny
+            selector_err_loss_num = selector_err_ce_num / selector_err_den.clamp_min(
+                err_floor
+            )
+            loss_num = (
+                loss_num
+                + effective_err_alpha * selector_err_loss_num * loss_denominator
+            )
         ratio_metrics = {
             "acc": (correct_num.detach(), accuracy_denom.detach()),
             "target_probability": (
@@ -780,12 +973,31 @@ class OnlineDFlashModel(nn.Module):
                     ),
                 }
             )
+        if self._selector_err_objective_enabled:
+            ratio_metrics.update(
+                {
+                    "selector_err_loss": (
+                        selector_err_ce_num.detach(),
+                        selector_err_den.detach(),
+                    ),
+                    "selector_err_accuracy": (
+                        selector_err_correct_num.detach(),
+                        selector_err_den.detach(),
+                    ),
+                    "selector_err_frontier_rate": (
+                        selector_err_den.detach(),
+                        accuracy_denom.detach(),
+                    ),
+                }
+            )
         metrics: Dict[str, object] = {
             "accuracy_denom": accuracy_denom.detach(),
             "ratio_metrics": ratio_metrics,
         }
         if has_selector_objective:
             metrics["selector_loss_alpha"] = effective_selector_alpha
+        if self._selector_err_objective_enabled:
+            metrics["selector_err_loss_alpha"] = effective_err_alpha
         # Reduce all chunks before flooring the denominator so the result does
         # not depend on how many chunks happen to contain no effective weight.
         denominator_floor = torch.finfo(loss_denominator.dtype).tiny

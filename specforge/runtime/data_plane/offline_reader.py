@@ -28,6 +28,16 @@ overlapped with compute.
 
 Set ``SPECFORGE_VALIDATE_OFFLINE_FEATURES=1`` (or pass ``validate_files=True``)
 to opt back into the eager pass and check a suspect dataset up front.
+
+Sidecars
+--------
+Some supervision is far cheaper to add next to an existing dump than to bake
+into it: the DFlash selector's target-greedy labels are ~6 KB per sample against
+~28 MB of hidden states, so rewriting the dump to carry them would move 168 GB to
+publish 19 MB. ``sidecar_dir`` therefore lets a caller name a directory of small
+per-sample ``<stem>.pt`` files whose keys are merged over the main file's on
+read. Every sample must have its sidecar; a partially built sidecar directory is
+rejected at assembly rather than silently training on a mix of two label sets.
 """
 
 from __future__ import annotations
@@ -48,9 +58,11 @@ _VALIDATE_ENV = "SPECFORGE_VALIDATE_OFFLINE_FEATURES"
 
 
 def _inspect_feature_file(
-    path: str, feature_keys: Tuple[str, ...]
+    path: str, feature_keys: Tuple[str, ...], sidecar_path: Optional[str] = None
 ) -> Tuple[Dict[str, FeatureSpec], int, int]:
     raw = load_feature_file(path)
+    if sidecar_path is not None:
+        raw = {**raw, **load_feature_file(sidecar_path)}
     missing = [key for key in feature_keys if key not in raw]
     if missing:
         raise KeyError(f"{path} missing required offline feature keys {missing}")
@@ -82,6 +94,15 @@ def list_feature_files(path: str) -> List[str]:
     return files
 
 
+def feature_file_stem(path: str) -> str:
+    """Strip the offline feature suffix, so ``a/b.ckpt.gz`` -> ``b``."""
+    name = os.path.basename(path)
+    for suffix in sorted(_FEATURE_SUFFIXES, key=len, reverse=True):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return os.path.splitext(name)[0]
+
+
 class OfflineManifestReader:
     """Reads a directory of offline feature files into ``SampleRef`` records."""
 
@@ -98,6 +119,7 @@ class OfflineManifestReader:
         max_len: int = 2048,
         target_repr: Optional[str] = "hidden_state",
         validate_files: Optional[bool] = None,
+        sidecar_dir: Optional[str] = None,
     ) -> None:
         self.hidden_states_path = hidden_states_path
         self.run_id = run_id
@@ -108,6 +130,7 @@ class OfflineManifestReader:
         self.ttt_length = ttt_length
         self.max_len = max_len
         self.target_repr = target_repr
+        self.sidecar_dir = sidecar_dir
         # Spec-less refs stay usable: FeatureDataLoader._validate_refs skips
         # spec comparison when no ref carries specs, the store resolves tensors
         # through feature_keys rather than specs, and nothing reads num_tokens
@@ -118,15 +141,38 @@ class OfflineManifestReader:
             validate_files = os.environ.get(_VALIDATE_ENV, "0") == "1"
         self.validate_files = bool(validate_files)
 
+    def _sidecar_for(self, path: str) -> Optional[str]:
+        if not self.sidecar_dir:
+            return None
+        sidecar = os.path.join(self.sidecar_dir, feature_file_stem(path) + ".pt")
+        if not os.path.isfile(sidecar):
+            raise FileNotFoundError(
+                f"sidecar {sidecar!r} is missing for feature file {path!r}. "
+                "A sidecar directory must cover every sample; training on the "
+                "subset that has one would silently mix two label sets."
+            )
+        return os.path.abspath(sidecar)
+
     def _ref_for(self, index: int, path: str) -> SampleRef:
         sample_id = f"{self.run_id}:{index:08d}"
         specs: Dict[str, FeatureSpec] = {}
         num_tokens = 0
         estimated_bytes = 0
+        sidecar_path = self._sidecar_for(path)
         if self.validate_files:
             specs, num_tokens, estimated_bytes = _inspect_feature_file(
-                path, self.feature_keys
+                path, self.feature_keys, sidecar_path
             )
+        metadata = {
+            "format": f"offline_{self.strategy}",
+            "target_repr": self.target_repr,
+            "schema_version": SCHEMA_VERSION,
+            "ttt_length": self.ttt_length,
+            "max_len": self.max_len,
+            "file_index": index,
+        }
+        if sidecar_path is not None:
+            metadata["sidecar_path"] = sidecar_path
         return SampleRef(
             sample_id=sample_id,
             run_id=self.run_id,
@@ -140,14 +186,7 @@ class OfflineManifestReader:
             tokenizer_version=self.tokenizer_version,
             num_tokens=num_tokens,
             estimated_bytes=estimated_bytes,
-            metadata={
-                "format": f"offline_{self.strategy}",
-                "target_repr": self.target_repr,
-                "schema_version": SCHEMA_VERSION,
-                "ttt_length": self.ttt_length,
-                "max_len": self.max_len,
-                "file_index": index,
-            },
+            metadata=metadata,
         )
 
     def __iter__(self) -> Iterator[SampleRef]:
@@ -163,4 +202,4 @@ class OfflineManifestReader:
         return refs
 
 
-__all__ = ["OfflineManifestReader", "list_feature_files"]
+__all__ = ["OfflineManifestReader", "feature_file_stem", "list_feature_files"]

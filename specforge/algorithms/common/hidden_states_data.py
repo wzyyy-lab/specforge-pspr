@@ -5,6 +5,7 @@ Used by the DFlash-family (DFlash/Domino/DSpark) and MTP algorithms.
 
 from __future__ import annotations
 
+import os
 from functools import partial
 
 from specforge.algorithms.common.collation import pad_and_concatenate_features
@@ -13,6 +14,33 @@ from specforge.data.loss_mask import has_consecutive_supervised_tokens
 NORMALIZER_ID = "dflash_family_offline_v1"
 DSPARK_NORMALIZER_ID = "dspark_offline_v1"
 MTP_NORMALIZER_ID = "mtp_offline_v1"
+
+# Optional per-sample supervision kept beside a hidden-state dump rather than
+# inside it: ``target_greedy[i]`` is the target model's own argmax for position
+# ``i + 1``, so it is directly comparable to ``input_ids[1:]``.
+#
+# The corpus next token and the target's greedy token disagree on ~22% of
+# supervised ShareGPT positions (measured). A backbone learning a distribution
+# averages that noise out, but a candidate *selector* cannot: its entire job is
+# deciding when to overrule the base top-1, which usually *is* the target's
+# greedy token, so a corpus label at those positions is a direct instruction to
+# make an override that decode can only reject. Hence a separate label set,
+# opt-in per algorithm, with the backbone objective left on the corpus labels.
+TARGET_GREEDY_KEY = "target_greedy"
+TARGET_GREEDY_SIDECAR_SUFFIX = ".target_greedy"
+
+
+def target_greedy_sidecar_dir(hidden_states_path):
+    """Return the conventional sidecar directory iff it exists.
+
+    Sibling of the dump (``<dump>.target_greedy``) so that the recursive
+    ``*.ckpt`` walk in ``list_feature_files`` can never pick sidecars up as
+    samples, and so that a dump and its labels can be moved together.
+    """
+    if not hidden_states_path:
+        return None
+    candidate = str(hidden_states_path).rstrip("/") + TARGET_GREEDY_SIDECAR_SUFFIX
+    return candidate if os.path.isdir(candidate) else None
 
 
 def _normalize_hidden_states(
@@ -65,11 +93,21 @@ def normalize_offline_sample(raw, max_len: int):
         raise ValueError(
             "offline DFlash-family samples require two consecutive supervised tokens"
         )
-    return {
+    normalized = {
         "input_ids": input_ids,
         "loss_mask": loss_mask,
         "hidden_states": hidden_states,
     }
+    if TARGET_GREEDY_KEY in raw:
+        target_greedy = raw[TARGET_GREEDY_KEY][:max_len].unsqueeze(0)
+        if target_greedy.shape[1] != input_ids.shape[1]:
+            raise ValueError(
+                "offline DFlash-family target_greedy has mismatched sequence "
+                f"length after truncation: input_ids={input_ids.shape[1]}, "
+                f"target_greedy={target_greedy.shape[1]}"
+            )
+        normalized[TARGET_GREEDY_KEY] = target_greedy
+    return normalized
 
 
 def normalize_dspark_offline_sample(raw, max_len: int):
@@ -107,14 +145,25 @@ def build_offline_reader(
     # Transitional runtime import; the composition root will inject this port.
     from specforge.runtime.data_plane.offline_reader import OfflineManifestReader
 
+    feature_keys = ("input_ids", "loss_mask", "hidden_states")
+    # Presence of the sidecar directory is itself the opt-in for *reading* the
+    # extra labels; whether an objective *uses* them is a separate config flag.
+    # Keying the read off the directory keeps the default path byte-identical:
+    # with no sidecar the key never enters feature_keys, never reaches the
+    # collator, and never reaches the model.
+    sidecar_dir = target_greedy_sidecar_dir(hidden_states_path)
+    if sidecar_dir is not None:
+        feature_keys = feature_keys + (TARGET_GREEDY_KEY,)
+
     return OfflineManifestReader(
         hidden_states_path,
         run_id=run_id,
         strategy=strategy,
-        feature_keys=("input_ids", "loss_mask", "hidden_states"),
+        feature_keys=feature_keys,
         target_repr=None,
         ttt_length=ttt_length,
         max_len=max_len,
+        sidecar_dir=sidecar_dir,
     )
 
 
@@ -161,8 +210,10 @@ def build_collator():
                 "input_ids": 1,
                 "loss_mask": 1,
                 "hidden_states": 1,
+                TARGET_GREEDY_KEY: 1,
             },
             required_keys=("input_ids", "loss_mask", "hidden_states"),
+            optional_keys=(TARGET_GREEDY_KEY,),
         )
 
     return collate
@@ -272,6 +323,8 @@ __all__ = [
     "DSPARK_NORMALIZER_ID",
     "MTP_NORMALIZER_ID",
     "NORMALIZER_ID",
+    "TARGET_GREEDY_KEY",
+    "TARGET_GREEDY_SIDECAR_SUFFIX",
     "build_collator",
     "build_dspark_collator",
     "build_dspark_offline_normalizer",
@@ -284,4 +337,5 @@ __all__ = [
     "normalize_dspark_offline_sample",
     "normalize_mtp_offline_sample",
     "normalize_offline_sample",
+    "target_greedy_sidecar_dir",
 ]

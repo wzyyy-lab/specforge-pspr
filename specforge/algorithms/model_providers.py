@@ -356,6 +356,12 @@ def _build_dflash_family_model(
         dtype=_torch_dtype(cfg),
         trust_remote_code=cfg.model.trust_remote_code,
     )
+    if hasattr(draft_model, "bind_target_decoder"):
+        draft_model.bind_target_decoder(target_parts.embed_tokens)
+    if hasattr(draft_model, "apply_backbone_freeze"):
+        frozen = draft_model.apply_backbone_freeze()
+        if frozen:
+            print(f"froze {frozen/1e6:.2f}M backbone parameters", flush=True)
     common = {
         "draft_model": draft_model,
         "target_lm_head": target_parts.lm_head,
@@ -392,9 +398,14 @@ def build_dflash_model(
             loss_type=cfg.training.loss_type,
             dpace_alpha=cfg.training.dpace_alpha,
             selector_loss_alpha=cfg.training.dflash2_selector_loss_alpha,
+            selector_err_loss_alpha=cfg.training.dflash2_selector_err_loss_alpha,
+            selector_own_denominator=cfg.training.dflash2_selector_own_denominator,
             selector_warmup_ratio=cfg.training.dflash2_selector_warmup_ratio,
             selector_ramp_ratio=cfg.training.dflash2_selector_ramp_ratio,
             selector_stop_gradient=cfg.training.dflash2_selector_stop_gradient,
+            selector_target_greedy_labels=(
+                cfg.training.dflash2_selector_target_greedy_labels
+            ),
             lk_loss_type=cfg.training.lk_loss_type,
             kl_scale=cfg.training.kl_scale,
             kl_decay=cfg.training.kl_decay,

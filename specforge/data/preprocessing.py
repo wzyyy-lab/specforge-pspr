@@ -710,11 +710,24 @@ def process_offline_dflash_sample(
         raise ValueError(
             "offline DFlash samples require two consecutive supervised tokens"
         )
-    return {
+    processed = {
         "input_ids": input_ids,
         "loss_mask": loss_mask,
         "hidden_states": hidden_states,
     }
+    # Optional per-position "what would the target itself emit here" labels. A re-ranking selector is
+    # judged at decode time against the target's greedy token, never against the corpus token, and on
+    # human-written corpora the two differ often enough to matter (0.77 agreement measured on
+    # ShareGPT). Capture pipelines that supply these let the selector train on its real objective.
+    if "target_greedy" in raw:
+        target_greedy = raw["target_greedy"][:max_len].unsqueeze(0)
+        if target_greedy.shape[1] != input_ids.shape[1]:
+            raise ValueError(
+                "offline DFlash target_greedy has a mismatched sequence length: "
+                f"target_greedy={target_greedy.shape[1]}, input_ids={input_ids.shape[1]}"
+            )
+        processed["target_greedy"] = target_greedy.to(torch.long)
+    return processed
 
 
 def process_token_dict_to_mappings(

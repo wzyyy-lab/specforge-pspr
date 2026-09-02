@@ -163,6 +163,7 @@ def algorithm_providers() -> AlgorithmProviders:
             draft_config=DraftConfigProvider(
                 architecture=DRAFT_ARCHITECTURE,
                 expected_auto_map_model="domino.DominoDraftModel",
+                compatible_architectures={DRAFT_ARCHITECTURE},
             ),
             build_draft=build_draft,
             build_training_model=build_training_model,

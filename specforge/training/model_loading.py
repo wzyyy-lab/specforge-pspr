@@ -379,14 +379,23 @@ def _load_pretrained_draft_state(
     cache_dir: Optional[str],
     trust_remote_code: bool,
 ) -> Dict[str, Any]:
+    import torch
+
     from specforge.modeling.auto import AutoDraftModel
 
+    # Pin fp32 instead of letting ``from_pretrained`` honour ``config.dtype``. This model exists only
+    # to be read back out as a state dict and copied into the real one, so every cast it performs is
+    # pure loss: a checkpoint that stores a head in fp32 (the point of storing it in fp32) would be
+    # rounded to the config dtype here and the destination would never see the precision it saved.
+    # Upcasting is lossless for any on-disk dtype, and ``load_state_dict`` below then performs the
+    # single unavoidable cast into whatever dtype the destination parameters actually have.
     loaded, loading_info = AutoDraftModel.from_pretrained(
         source,
         config=draft_config,
         cache_dir=cache_dir,
         trust_remote_code=trust_remote_code,
         output_loading_info=True,
+        dtype=torch.float32,
     )
     missing_from_source = set(loading_info.get("missing_keys") or [])
     state = {
@@ -442,6 +451,18 @@ def warm_start_draft_model(
     allowed_missing = set()
     if allow_missing_embedding:
         allowed_missing = {key for key in result.missing_keys if "embed" in key.lower()}
+    # An architecture may add a head that has no counterpart in a backbone-only checkpoint, which is
+    # the normal way to warm-start a new head on a released backbone. The architecture declares which
+    # prefixes are legitimately absent rather than the loader relaxing the check for everyone.
+    # The exemption is all-or-nothing per prefix: a checkpoint that carries *part* of a head is a
+    # partially-applied warm start, not a fresh head, so the remainder stays required. Without this,
+    # declaring a prefix optional also silently forfeits the ability to detect a head that a joint
+    # checkpoint was supposed to bring along.
+    for prefix in tuple(getattr(model, "warm_start_optional_prefixes", ())):
+        absent = {key for key in result.missing_keys if key.startswith(prefix)}
+        if not absent or any(key.startswith(prefix) for key in state):
+            continue
+        allowed_missing |= absent
     required_missing = sorted(set(result.missing_keys) - allowed_missing)
     if required_missing:
         raise ValueError(

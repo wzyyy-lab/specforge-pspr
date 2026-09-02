@@ -137,6 +137,7 @@ class OfflineStorageContract:
     required_tensors: FrozenSet[str]
     normalizer: str
     schema_version: int = 1
+    optional_tensors: FrozenSet[str] = frozenset()
 
     def __post_init__(self) -> None:
         for field_name in ("format", "normalizer"):
@@ -148,14 +149,23 @@ class OfflineStorageContract:
                 )
         if self.schema_version != 1:
             raise ValueError("only offline storage schema_version=1 is supported")
-        object.__setattr__(
-            self,
-            "required_tensors",
-            _normalized_names(
-                self.required_tensors,
-                field_name="required_tensors",
-            ),
+        required = _normalized_names(
+            self.required_tensors,
+            field_name="required_tensors",
         )
+        optional = _normalized_names(
+            self.optional_tensors,
+            field_name="optional_tensors",
+            allow_empty=True,
+        )
+        overlap = required & optional
+        if overlap:
+            raise ValueError(
+                "required_tensors and optional_tensors must be disjoint, got "
+                f"{sorted(overlap)}"
+            )
+        object.__setattr__(self, "required_tensors", required)
+        object.__setattr__(self, "optional_tensors", optional)
 
 
 @dataclass(frozen=True)

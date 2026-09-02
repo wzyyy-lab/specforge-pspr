@@ -499,18 +499,28 @@ class DFlashTrainStrategy(DraftTrainStrategy):
         device = self._device()
         selector_loss_alpha = self._selector_loss_alpha(ctx)
         max_valid_anchors = _cpu_max_valid_anchors(t["loss_mask"])
+        # Optional sidecar supervision; absent on every dump that predates it, in
+        # which case the model keeps using the corpus labels.
+        target_greedy = t.get("target_greedy")
+        if target_greedy is not None:
+            target_greedy = target_greedy.to(device, non_blocking=True)
         loss, accuracy, model_metrics = self.dflash_model(
             input_ids=t["input_ids"].to(device, non_blocking=True),
             hidden_states=t["hidden_states"].to(device, non_blocking=True),
             loss_mask=t["loss_mask"].to(device, non_blocking=True),
             max_valid_anchors=max_valid_anchors,
             selector_loss_alpha=selector_loss_alpha,
+            target_greedy=target_greedy,
         )
         metrics = {"accuracy": accuracy.detach()}
         if "accuracy_denom" in model_metrics:
             metrics["accuracy_denom"] = model_metrics["accuracy_denom"]
         if "selector_loss_alpha" in model_metrics:
             metrics["selector_loss_alpha"] = model_metrics["selector_loss_alpha"]
+        if "selector_err_loss_alpha" in model_metrics:
+            metrics["selector_err_loss_alpha"] = model_metrics[
+                "selector_err_loss_alpha"
+            ]
         return StepOutput(
             loss=loss,
             metrics=metrics,

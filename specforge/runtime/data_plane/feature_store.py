@@ -510,13 +510,23 @@ class LocalFeatureStore(FeatureStore):
         self, path: str, ref: SampleRef, wanted: List[str]
     ) -> Dict[str, torch.Tensor]:
         raw = load_feature_file(path)
+        # A sidecar carries supervision too small to justify rewriting the main
+        # dump (see OfflineManifestReader). It is opened lazily, on the first key
+        # the main file cannot serve, so a ref that happens to carry a sidecar
+        # path costs nothing on the batches that never ask for a sidecar key.
+        sidecar_path = (ref.metadata or {}).get("sidecar_path")
+        sidecar_loaded = False
         out = {}
         for n in wanted:
             # feature_keys may remap a logical name -> a raw file key.
             raw_key = ref.feature_keys.get(n, n)
             raw_key = raw_key.split("/")[-1] if "/" in raw_key else raw_key
+            if raw_key not in raw and sidecar_path and not sidecar_loaded:
+                raw = {**raw, **load_feature_file(sidecar_path)}
+                sidecar_loaded = True
             if raw_key not in raw:
-                raise KeyError(f"{path} missing key {raw_key!r} for feature {n!r}")
+                where = path if sidecar_path is None else f"{path} (+{sidecar_path})"
+                raise KeyError(f"{where} missing key {raw_key!r} for feature {n!r}")
             out[n] = raw[raw_key]
         return out
 

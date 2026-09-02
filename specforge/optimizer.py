@@ -23,10 +23,15 @@ class BF16Optimizer:
         warmup_ratio=0.015,
         lr_scheduler="cosine",
         offload_master=False,
+        lr_scale_rules=None,
+        weight_decay_rules=None,
     ):
         # defaults copied from EAGLE traineagle3 ds_config.json
         self.model = model
-        self.model_params = [p for p in model.parameters() if p.requires_grad]
+        named_trainable = [
+            (name, p) for name, p in model.named_parameters() if p.requires_grad
+        ]
+        self.model_params = [p for _, p in named_trainable]
         self.max_grad_norm = max_grad_norm
         self.offload_master = bool(offload_master)
         self.fp32_params = [
@@ -39,8 +44,12 @@ class BF16Optimizer:
         ]
         for mp in self.fp32_params:
             mp.requires_grad = True
+        self.lr_scale_rules = tuple(lr_scale_rules or ())
+        self.weight_decay_rules = tuple(weight_decay_rules or ())
         self.optimizer = torch.optim.AdamW(
-            self.fp32_params, lr=lr, weight_decay=weight_decay
+            self._parameter_groups(named_trainable, lr, weight_decay),
+            lr=lr,
+            weight_decay=weight_decay,
         )
         self.last_grad_norm = None
         self._grad_norm_process_group = None
@@ -60,6 +69,51 @@ class BF16Optimizer:
             total_steps=total_steps,
             warmup_steps=int(warmup_ratio * total_steps),
         )
+
+    def _parameter_groups(self, named_trainable, lr, weight_decay):
+        """Group the fp32 masters by (learning-rate scale, weight decay), preserving their order.
+
+        Joint training of a pretrained backbone together with a freshly initialised head needs two
+        learning rates: the rate that trains the head in reasonable time will damage the backbone.
+        Every scheduler here derives its per-step values from ``base_lrs``, which PyTorch collects
+        per parameter group, so distinct group learning rates survive warmup and annealing.
+
+        Weight decay is grouped alongside the rate because a single learnable gain cannot share the
+        backbone's decay. The dh2048 recipe (``TAPS-SP/scripts/train_accept_selector.py``) puts the
+        selector's scalar ``gamma`` in its own AdamW group at ``5 * lr`` with ``weight_decay=0``:
+        ``gamma`` starts at 0 and has to travel to ~1 for the head to have any effect at all, so a
+        shared rate makes it the slowest thing in the model, and a shared decay actively pulls it
+        back toward the no-op point.
+
+        ``fp32_params`` order is deliberately untouched -- ``step`` zips it against
+        ``model_params``, and checkpoints store it positionally.
+        """
+        if not self.lr_scale_rules and not self.weight_decay_rules:
+            return self.fp32_params
+
+        def match(rules, name, default):
+            for prefix, value in rules:
+                if name.startswith(prefix) or f".{prefix}" in name:
+                    return float(value)
+            return default
+
+        buckets: dict[tuple[float, float], list] = {}
+        for (name, _), master in zip(named_trainable, self.fp32_params):
+            key = (
+                match(self.lr_scale_rules, name, 1.0),
+                match(self.weight_decay_rules, name, weight_decay),
+            )
+            buckets.setdefault(key, []).append(master)
+        groups = [
+            {"params": params, "lr": lr * scale, "weight_decay": wd}
+            for (scale, wd), params in sorted(buckets.items(), reverse=True)
+        ]
+        summary = ", ".join(
+            f"{len(g['params'])} tensors @ lr*{g['lr'] / lr:.4g} wd={g['weight_decay']:g}"
+            for g in groups
+        )
+        logger.info("BF16Optimizer parameter groups: %s", summary)
+        return groups
 
     def configure_grad_norm_reduction(
         self, *, process_group=None, enabled: bool = True

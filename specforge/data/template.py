@@ -119,6 +119,24 @@ TEMPLATE_REGISTRY.register(
     ),
 )
 
+# Same as "qwen" but without the injected system turn. parse.py:211-212 appends `system_prompt` as a
+# system message whenever it is non-empty, so "qwen" renders
+# `<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n` in front of every training sequence.
+# A speculative-decoding deployment that builds its prompt with
+# `tokenizer.apply_chat_template(..., add_generation_prompt=True)` emits no system turn at all, so
+# the draft would be trained on a prefix distribution it never sees at decode time. With
+# `system_prompt=None` the rendered sequence is byte-identical to the tokenizer's own template and
+# the loss mask is unchanged.
+TEMPLATE_REGISTRY.register(
+    name="qwen-nosys",
+    template=ChatTemplate(
+        assistant_header="<|im_start|>assistant\n",
+        user_header="<|im_start|>user\n",
+        system_prompt=None,
+        end_of_turn_token="<|im_end|>\n",
+    ),
+)
+
 TEMPLATE_REGISTRY.register(
     name="lfm",
     template=ChatTemplate(

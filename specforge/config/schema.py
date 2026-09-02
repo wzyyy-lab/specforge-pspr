@@ -19,7 +19,7 @@ from __future__ import annotations
 import copy
 import json
 import os
-from typing import List, Literal, Optional
+from typing import Dict, List, Literal, Optional
 from urllib.parse import urlparse
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -569,8 +569,29 @@ class TrainingConfig(StrictConfigModel):
         "dpace-continuation-value-only",
     ] = "dflash"
     dpace_alpha: float = 0.5
+    #: Per-prefix learning-rate multipliers on draft parameter names, e.g.
+    #: ``{"model.": 0.05}`` to fine-tune a pretrained backbone far more slowly than a freshly
+    #: initialised head during joint training. Unmatched parameters keep the configured rate;
+    #: the longest matching prefix wins.
+    lr_scale_rules: Dict[str, float] = Field(default_factory=dict)
+    #: AdamW weight decay. Reaches the optimizer for every strategy; the default keeps the historical
+    #: behaviour of no decay.
+    weight_decay: float = Field(default=0.0, ge=0.0)
+    #: Per-prefix weight-decay overrides on draft parameter names, e.g.
+    #: ``{"candidate_selector.gamma": 0.0}``. The dh2048 recipe exempts the selector's scalar gain
+    #: from decay: it starts at 0 and must travel to ~1 for the head to have any effect, so shared
+    #: decay actively pulls it back toward the no-op point. Unmatched parameters keep
+    #: ``weight_decay``; the longest matching prefix wins.
+    weight_decay_rules: Dict[str, float] = Field(default_factory=dict)
     #: Weight of the top-k path-selector objective for DFlash2 drafts.
     dflash2_selector_loss_alpha: float = Field(default=1.0, ge=0.0)
+    #: Weight of the selector's optional frontier "base top-1 is wrong" detector objective. Applies
+    #: to any selector that declares ``wants_err_objective``; 0 leaves the detector untrained.
+    dflash2_selector_err_loss_alpha: float = Field(default=0.0, ge=0.0)
+    #: Average the selector's CE over covered slots instead of over the base objective's denominator.
+    #: The latter scales the term by top-k coverage, which makes the selector's effective weight
+    #: depend on backbone recall; the former matches the reference selector training setup.
+    dflash2_selector_own_denominator: bool = False
     #: Fraction of optimizer steps that train only the DFlash2 base objective.
     dflash2_selector_warmup_ratio: float = Field(default=0.0, ge=0.0, le=1.0)
     #: Fraction of optimizer steps used to ramp the selector weight to its target.
@@ -578,6 +599,12 @@ class TrainingConfig(StrictConfigModel):
     #: Stop selector gradients at the unary/backbone boundary while preserving
     #: the primary DFlash/D-PACE/LK gradient path.
     dflash2_selector_stop_gradient: bool = False
+    #: Supervise the selector with the target model's own greedy token instead of the corpus next
+    #: token. Requires a ``<hidden_states_dir>.target_greedy`` sidecar (scripts/dump_target_greedy.py).
+    #: The two disagree on ~22% of supervised ShareGPT positions, and at those positions the corpus
+    #: label asks the selector to overrule a base top-1 that decode would have accepted. The backbone
+    #: objective is unaffected and keeps the corpus labels.
+    dflash2_selector_target_greedy_labels: bool = False
     lambda_base_start: float = 1.0
     lambda_base_decay_ratio: float = 0.5
     dspark_ce_loss_alpha: float = 0.1

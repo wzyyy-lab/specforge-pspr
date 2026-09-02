@@ -266,11 +266,19 @@ class _ConfiguredOptimizerFactory:
         return BF16Optimizer(
             draft_module,
             lr=t.learning_rate,
+            weight_decay=t.weight_decay,
             max_grad_norm=t.max_grad_norm,
             warmup_ratio=t.warmup_ratio,
             lr_scheduler=t.lr_scheduler,
             total_steps=self.total_steps,
             offload_master=t.optimizer_cpu_offload,
+            # Longest prefix first, so a specific rule can override a broader one.
+            lr_scale_rules=tuple(
+                sorted(t.lr_scale_rules.items(), key=lambda kv: -len(kv[0]))
+            ),
+            weight_decay_rules=tuple(
+                sorted(t.weight_decay_rules.items(), key=lambda kv: -len(kv[0]))
+            ),
         )
 
 
