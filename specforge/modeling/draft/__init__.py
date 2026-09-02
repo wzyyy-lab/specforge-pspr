@@ -11,6 +11,7 @@ from .dspark import DSparkDraftModel
 from .llama3_eagle import LlamaForCausalLMEagle3
 from .mtp import Qwen3_5MTPDraftModel
 from .peagle import PEagleDraftModel
+from .pspr import PSPRDraftModel
 from .registry import DRAFT_REGISTRY, available_drafts, register_draft, resolve_draft
 
 __all__ = [
@@ -21,6 +22,7 @@ __all__ = [
     "DSparkDraftModel",
     "LlamaForCausalLMEagle3",
     "PEagleDraftModel",
+    "PSPRDraftModel",
     "Qwen3_5MTPDraftModel",
     "build_target_layer_ids",
     "extract_context_feature",
