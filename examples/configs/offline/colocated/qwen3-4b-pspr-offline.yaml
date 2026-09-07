@@ -8,7 +8,13 @@ model:
 data:
   hidden_states_path: ./cache/hidden_states/sharegpt3k
   max_length: 3072
-  chat_template: qwen
+  # qwen-nosys, not qwen: the `qwen` template injects system_prompt="You are a helpful assistant."
+  # into every training sequence (specforge/data/parse.py:211-212), while the evaluator
+  # (TAPS-SP/scripts/decode_lattice.py:347) and the data regeneration both build the prompt from a
+  # bare user turn. Under `qwen` the draft is trained on a prefix that does not exist at deployment.
+  # Verified byte-identical to the tokenizer's own jinja output with the system turn removed, and
+  # loss_mask is unchanged.
+  chat_template: qwen-nosys
   cache_dir: ./cache
 
 training:
@@ -31,7 +37,8 @@ training:
   loss_decay_gamma: null
   dflash2_selector_loss_alpha: 1.0
   dflash2_selector_err_loss_alpha: 1.0
-  dflash2_selector_own_denominator: true
+  # Local objective means are not partition-invariant; share TrainerCore's global base denominator.
+  dflash2_selector_own_denominator: false
   dflash2_selector_warmup_ratio: 0.0
   dflash2_selector_ramp_ratio: 0.0
   dflash2_selector_stop_gradient: true

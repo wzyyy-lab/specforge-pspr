@@ -1,5 +1,11 @@
 # PSPR — 面向 draft block top-K 候选格的双向路径选择头
 
+> **⚠️ 本文只覆盖 PSPR v1（`pspr.py`），已过时。**
+> 全家族总览（v1 / v2 / cloze / slotdeep / decision / cascade / memory）见 **[`docs/pspr/README.md`](./docs/pspr/README.md)**；
+> 当前最优版本的详细说明见 **[`docs/pspr/SLOTDEEP.md`](./docs/pspr/SLOTDEEP.md)**。
+> 本文另有一处已知失效：§5.3 记的 `dflash2_selector_own_denominator: true` 现已被代码硬拒
+> （`dflash_family_model.py:527`），因为局部 selector 均值在 DDP/梯度累积下非分区不变。
+
 PSPR 是一个投机解码 draft 头，构建在 DFlash 的 block-diffusion 骨干之上：*a bidirectional path
 selector over the draft block's top-K candidate lattice*。本文档说明它在本仓库中的代码位置、
 训练方式和参数配置依据。

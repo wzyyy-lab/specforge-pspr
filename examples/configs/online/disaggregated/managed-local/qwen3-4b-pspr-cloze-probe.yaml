@@ -1,0 +1,186 @@
+# PSPR-cloze: masked-LM lattice repair, trained on PerfectBlend with the OFFICIAL DFlash backbone
+# frozen -- the exact same pipeline, data, optimiser and step budget as qwen3-4b-pspr-v2-final.yaml,
+# so the ONLY moving variable is where `delta` comes from.
+#
+# The claim under test
+# --------------------
+# v2's bidirectional encoder collapses each slot's 16 candidates into one probability-weighted
+# centroid BEFORE attention, so no term in it can express "candidate A at slot t is right because
+# candidate B sits at slot t+1", and slot t's prediction is never conditioned on "slot t unknown,
+# everything else a definite token".  On the stage-1 trace 3,824 of 4,499 first errors (85.0%) have
+# the correct token inside top-16 while the selector ranks it first in only ~40%: a selection-quality
+# gap, not missing information.
+#
+# PSPR-cloze replaces the centroid encoder with H masked-LM-shaped rows: for query slot i, slot i is
+# [MASK] and every other position carries the fixed draft top-1 seed.  The actual committed prefix is
+# supplied separately by the retained GRU.  This distinction is deliberate: putting selected tokens
+# in the left half would make row i depend on earlier decisions and require H serial encoder passes.
+# Readout, objective, decode gate and metrics are unchanged.
+#
+# Baseline to beat (identical backbone, identical gate tau=0/rho=3/theta=0, n=20):
+#   stage-1 selector   macro 5.7743
+#   v2 @ step2000      macro 5.9048
+#   v2 @ step4000      macro 5.9700   <- the number this run must clear
+#   official Domino    macro 6.4255
+#
+# `selector_bidirectional: false` in the draft config is the control: identical parameters and FLOPs,
+# only the future half of the attention removed.
+
+model:
+  target_model_path: /kl_infra_infer_intern/wangzhuoyu/TAPS-SP/models/Qwen3-4B
+  draft_model_config: configs/qwen3-4b-pspr-cloze.json
+  # Official DFlash-b16: 58 backbone tensors, no selector tensors.  PSPRv2DraftModel declares
+  # `candidate_selector.` as an optional warm-start prefix, so the repairer stays at its zero-init
+  # no-op (delta == 0 => predictions identical to plain DFlash at step 0) while the backbone loads
+  # warm and is then frozen by `freeze_backbone: true` in the draft config.
+  draft_checkpoint_path: /kl_infra_infer_intern/wangzhuoyu/TAPS-SP/models/Qwen3-4B-DFlash-b16
+  target_backend: sglang
+  embedding_key: model.embed_tokens.weight
+  torch_dtype: bfloat16
+  mask_token_id: 151669
+  sglang_context_length: 3200
+
+data:
+  train_data_path: ./cache/dataset/perfectblend_qwen3-4b_regen.jsonl
+  max_length: 3072
+  # Evaluation renders a bare user turn, so do not inject a system message.
+  chat_template: qwen-nosys
+  cache_dir: ./cache
+  build_dataset_num_proc: 32
+
+training:
+  strategy: dflash
+  num_epochs: 1
+  batch_size: 2
+  accumulation_steps: 2
+  fsdp_sharding: "NO_SHARD"
+
+  # Only the corrector trains; the backbone carries requires_grad=False from apply_backbone_freeze,
+  # so no scale rule can leak the head's rate into it.  5e-4 is the rate stage-1 proved on this head
+  # (4e-4 * sqrt(2) effective), and the audit's warning against 6e-4 was about exposing the BACKBONE
+  # to the head's rate and forgetting code/math -- with the backbone frozen there is nothing to
+  # forget.  The online global batch is ~28x larger in anchors, so if anything this is conservative.
+  learning_rate: 5.0e-4
+  # 0.03 (213 steps) is what v2 used with a 3-layer encoder.  Doubled here because the
+  # 6-layer pre-LN stack starts from scratch AND `delta_w2` is zero-initialised, which makes
+  # the upstream gradient exactly zero on step 1 -- the encoder cannot start learning until
+  # W2 has grown, so the ramp needs more room.
+  warmup_ratio: 0.06
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  weight_decay_rules:
+    # `match()` scans rules sorted by DESCENDING prefix length and returns the first hit, so v2's
+    # catch-all `candidate_selector.` (19 chars) shadows every shorter rule -- which is why v2 ends
+    # up decaying all 74 of its LayerNorm weights, LayerNorm biases and biases at 2e-3.  cloze has
+    # three times as many LayerNorms (per-stream input norms, per-stream fusion norms, 12 encoder
+    # norms), so that bug would bite much harder here.
+    #
+    # Instead there is NO catch-all: `training.weight_decay: 0.0` is the default every parameter
+    # falls through to, and only the 34 two-dimensional weight matrices (41.95M of the 42.04M) are
+    # listed explicitly.  Verified exhaustively: every `dim() >= 2` non-embedding tensor matches a
+    # rule and every LayerNorm / bias / embedding-like tensor matches none.
+    "in_proj_weight": 2.0e-3
+    "out_proj.weight": 2.0e-3
+    "linear1.weight": 2.0e-3
+    "linear2.weight": 2.0e-3
+    "weight_ih_l0": 2.0e-3
+    "weight_hh_l0": 2.0e-3
+    "h_in.weight": 2.0e-3
+    "tok_in.weight": 2.0e-3
+    "conf_in.weight": 2.0e-3
+    "delta_w1.weight": 2.0e-3
+    "delta_w2.weight": 2.0e-3
+    "err_seed_in.weight": 2.0e-3
+    "err_head.1.weight": 2.0e-3
+    "err_head.4.weight": 2.0e-3
+
+  attention_backend: flex_attention
+  num_anchors: 512
+  # cloze's encoder runs H rows per block, so a chunk's activation peak is ~7x v2's:
+  # measured 9.28 GiB at BA=128, and the real chunk is BA = batch_size * 128 = 256.
+  # Halving the chunk halves that peak; total FLOPs are unchanged (this is only the
+  # gradient-checkpointing granularity).
+  objective_chunk_blocks: 64
+
+  # Backbone objective. The backbone is frozen, so this term produces no gradient; it is retained
+  # only because the lattice is read off `objective_logits` and its telemetry tracks whether the
+  # frozen feature stream is what stage-1 measured.
+  loss_type: dpace
+  dpace_alpha: 0.5
+  lk_loss_type: lambda
+  kl_scale: 1.0
+  kl_decay: 1.0
+
+  # Stage-1's 16-way covered-slot cross-entropy, kept after an 8-run architecture probe on the
+  # trace (scripts/probe_matrix.sh, scripts/probe_matrix2.sh) refuted every alternative:
+  #
+  #   A  v1 information flow, 16-way CE                +0.418   <- this config
+  #   E  A + committed-path rank fed to the GRU        +0.416
+  #   F  A + 0.5 * dense full-vocab auxiliary          +0.402
+  #   B  A + h_t wired into the corrector at 2560      +0.373
+  #   C  B + dense full-vocab CE                       +0.348
+  #   D  C without cross-slot attention                +0.325
+  #
+  # and, decisively, the gain-vs-data slopes do not cross: A gains +0.144 per doubling of anchors
+  # against C's +0.100, so A stays ahead at PerfectBlend scale rather than being overtaken.  The
+  # `full_vocab` objective remains implemented and gated (scripts/gate_pspr_v2_full_vocab.py) but is
+  # not what this run uses.
+  dflash2_selector_objective: multiclass
+  # Uniform coverage plus extra weight on the slot the metric is actually decided at.
+  #
+  # `uniform` (what v2 trained under) spends the same capacity on all 15 slots, but accept length
+  # truncates at ONE of them: the first the selector gets wrong.  `teacher_forced_frontier` is the
+  # opposite extreme and zeroes everything past that slot, which starves precisely the non-frontier
+  # representations a cloze row reads as context.  `uniform_frontier_boost` keeps the whole uniform
+  # signal and multiplies the current first error by (1 + boost), so no slot loses supervision.
+  # boost=0 is bit-identical to `uniform`.  At boost=3 the frontier carries ~22% of a block's
+  # selector weight against 6.7% under uniform.
+  dflash2_selector_weight_mode: uniform_frontier_boost
+  dflash2_selector_frontier_boost: 3.0
+  dflash2_selector_loss_alpha: 1.0
+  # The frontier detector still trains, so the calibrated decode gate keeps working.
+  dflash2_selector_err_loss_alpha: 1.0
+  # Must remain false: a local selector mean changes with rank/microbatch partitioning.
+  dflash2_selector_own_denominator: false
+  dflash2_selector_warmup_ratio: 0.0
+  dflash2_selector_ramp_ratio: 0.0
+  dflash2_selector_stop_gradient: false
+  dflash2_selector_target_greedy_labels: false
+
+  save_interval: 100000
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+
+tracking:
+  report_to: tensorboard
+
+runtime:
+  producer_lease: 8
+  producer_concurrency: 2
+  in_flight_high_watermark: 256
+  in_flight_low_watermark: 192
+
+run_id: qwen3-4b-pspr-cloze-probe
+output_dir: ./outputs/qwen3-4b-pspr-cloze-probe
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 7
+  disaggregated:
+    control_dir: outputs/qwen3-4b-pspr-cloze-probe/control
+    consumer_state_dir: outputs/qwen3-4b-pspr-cloze-probe/consumer-state
+    backend: mooncake
+    managed_local:
+      trainer_cuda_visible_devices: ["1", "2", "3", "4", "5", "6", "7"]
+      mooncake:
+        protocol: tcp
+        global_segment_size_bytes: 34359738368
+        local_buffer_size_bytes: 2147483648
+      capture_servers:
+        - port: 30000
+          cuda_visible_devices: ["0"]
+          tp_size: 1
+          mem_fraction_static: 0.5

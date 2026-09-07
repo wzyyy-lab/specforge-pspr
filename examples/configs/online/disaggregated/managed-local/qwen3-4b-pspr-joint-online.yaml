@@ -7,7 +7,7 @@ model:
   #       --draft-config configs/qwen3-4b-pspr-joint.json --output-dir outputs/pspr_joint_init
   # A randomly initialised selector produces no useful gradient for the backbone, so training both
   # from scratch spends the backbone's budget being dragged by a head that has not learned yet.
-  draft_checkpoint_path: ./outputs/pspr_joint_init
+  draft_checkpoint_path: ./outputs/pspr_s1_step2000_init
   # Online capture requires the sglang backend; the server must be the spec-capture patched build.
   target_backend: sglang
   embedding_key: model.embed_tokens.weight
@@ -46,8 +46,24 @@ training:
   # Producer prompt passes. This is the ONLY knob controlling how many times the 200k rows are seen:
   # the consumer walks a single consume-once stream and never replays it as a trainer epoch
   # (runtime/ARCHITECTURE.md:29-33).
-  # 6 passes matches the official qwen3-4b-dflash recipe's num_epochs.
-  num_epochs: 6
+  # 6 passes matches the official qwen3-4b-dflash recipe's num_epochs -- but that recipe trains from
+  # scratch. Both halves of this model are already converged, so 1 pass is the horizon: it is also
+  # what makes the pilot meaningful, because `warmup_ratio` below is a FRACTION of total_steps. At
+  # 6 passes (42705 steps) warmup alone is 1708 steps, so a 400-step pilot would never reach the
+  # configured rate and could not falsify anything about it. At 1 pass (7117 steps) warmup is 285
+  # steps and a 400-step pilot measures the real rate.
+  #
+  # S2 (this arm) raises 1 -> 3. S1 ran 1 pass with the backbone throttled to 3e-5 and measured
+  # six-domain macro 5.7217 -> 6.0523 (step 1000) -> 6.1565 (step 2000); a log fit on those two
+  # post-warmup points projects 6.347 at 7117 steps, i.e. SHORT of the official Domino 6.4255. The
+  # cause is budget, not modelling: the official domino recipe
+  # (examples/configs/online/disaggregated/external/qwen3-8b-domino-online.yaml) trains its WHOLE
+  # model at learning_rate 6.0e-4 for num_epochs 6, so S1's backbone ran at roughly 1/120 of the
+  # opponent's optimizer budget. The two alternative levers were measured and rejected: the gate is
+  # saturated (sweeping rho over {3,2,1,0.5} x theta {0,0.35} on S1's step-1000 checkpoint moved
+  # gsm8k only 7.625 -> 7.663, and every theta=0.35 cell was worse), and top-K recall at the frontier
+  # is already 0.92-0.93, so the candidate set is not the constraint either. That leaves the backbone.
+  num_epochs: 3
   # max_steps is deliberately unset. Setting it suppresses the schedule sidecar the producer writes,
   # which is what gives an exact `total_steps = num_prompts * num_epochs / (dp*bs*accum)` horizon
   # (training/schedule.py:64-68). With dp=7, bs=2, accum=2 the quantum is 28.
@@ -59,8 +75,9 @@ training:
   accumulation_steps: 2
   # Official dp7 recipes pin this; the default SHARD_GRAD_OP is not what they run.
   fsdp_sharding: "NO_SHARD"
-  # Whole-model rate, single group (see the Optimizer note below). Official dflash/dflash2 both run
-  # 6e-4, but from scratch; this run continues from converged weights. Set by the AI sweep.
+  # Single effective rate would be what the official domino recipe does (no lr_scale_rules, whole
+  # model at 6.0e-4). S2 tried exactly that and was falsified; see the Optimizer note. This is
+  # therefore the SELECTOR's rate, and the backbone is scaled to 0.05x = 3e-5 by the catch-all below.
   learning_rate: 6.0e-4
   warmup_ratio: 0.04
   max_grad_norm: 1.0
@@ -93,30 +110,75 @@ training:
   loss_decay_gamma: 7.0
 
   # --- Optimizer -------------------------------------------------------------------------------
-  # SINGLE param group, exactly like every official dflash/dflash2/domino recipe. An earlier
-  # revision of this file added `lr_scale_rules: {"candidate_selector.": 20.0}` citing
-  # specforge/optimizer.py:75-77, but that docstring's premise is a "pretrained backbone together
-  # with a FRESHLY INITIALISED head", and it justifies gamma's extra multiplier with "gamma starts
-  # at 0 and has to travel to ~1". Neither holds here: the head is the stage-1 selector at its best
-  # checkpoint and gamma warm-starts at 0.6902. Both halves of this model are already-converged
-  # weights, so there is no fast/slow split to make -- they take the same rate, single group.
+  # TWO effective rates: selector at `learning_rate`, backbone at 0.05x of it.
   #
-  # `learning_rate` below is therefore the rate for the WHOLE model. It is the one value that cannot
-  # be settled by reading the repo: 6e-4 is calibrated for from-scratch training (no official recipe
-  # sets draft_checkpoint_path), while continuing from converged weights normally wants less. It is
-  # resolved empirically by the short-run sweep recorded in EXPERIMENT_LOG iteration AI rather than
-  # guessed here.
+  # S1 ran a differential rate: `{"": 0.05}` put the backbone at 3e-5 while the selector kept 6e-4.
+  # S2 removed the throttle (all groups 1.0, whole model at 6e-4, matching the official domino
+  # recipe) and was FALSIFIED at step 2000. The damage is domain-specific catastrophic forgetting,
+  # invisible on the domain the pilot happened to use:
   #
-  # weight_decay stays at the default 0: every official dflash recipe sets none.
+  #   domain     step0   S1@2000 (3e-5)   S2@2000 (6e-4)
+  #   gsm8k      6.813   7.972            7.954
+  #   math500    8.139   8.697            8.199
+  #   humaneval  6.676   6.935            6.390   <- BELOW the released backbone's own level
+  #   mbpp       6.399   6.779            6.165   <- BELOW the released backbone's own level
+  #   alpaca     2.959   3.030            2.959
+  #   mt-bench   3.344   3.526            3.373
+  #   MACRO      5.7217  6.1565           5.8400
+  #
+  # The frontier top-K recall guard fired too: 0.8592 aggregated over the six domains against the
+  # 0.9192 baseline, i.e. -0.060 against a -0.020 stop threshold. So 6e-4 deletes the candidates the
+  # selector has to choose among, on exactly the domains the training corpus under-covers.
+  #
+  # S3 (this arm) therefore restores 0.05 and spends the budget on `num_epochs` instead: at 3e-5
+  # every one of the six domains rose monotonically (step0 < step1000 < step2000, no exception), so
+  # the rate is empirically forgetting-free and the horizon is the lever with no damage mechanism.
+  #
+  # Matching is longest-prefix, so the order written here is for readability only: assembly.py:277
+  # sorts by descending prefix length before the optimizer sees the rules (optimizer.py's matcher
+  # itself returns on first hit, which is exactly why that sort exists). The catch-all must be
+  # written as `""` -- PSPRDraftModel's backbone tensors are named `layers.*`, `norm.*`, `fc.*`,
+  # `hidden_norm.*` with NO `model.` prefix, so the intuitive `{"model.": 0.05}` silently matches
+  # nothing and would leave the backbone at the full rate.
+  #
+  # gamma deliberately does NOT get the dh2048 recipe's 5x. That multiplier exists because gamma
+  # starts at 0 and must travel to ~1 before the head does anything; ours warm-starts at 0.6902.
+  lr_scale_rules:
+    "candidate_selector.gamma": 1.0
+    "candidate_selector.": 1.0
+    "": 0.05
+  # Backbone decay stays at the official recipes' 0; the selector keeps the 2e-3 it was trained
+  # under in stage-1, and gamma is exempt (decay on a single gain that anchors the head's strength
+  # pulls it back toward the no-op point). First match wins here too.
+  weight_decay: 0.0
+  weight_decay_rules:
+    "candidate_selector.gamma": 0.0
+    "candidate_selector.predecessor_codebook": 0.0
+    "candidate_selector.successor_codebook": 0.0
+    "candidate_selector.": 2.0e-3
 
   # --- Selector objective ------------------------------------------------------------------------
-  # loss = CE_backbone(decayed) + 1.0 * mean_covered CE_selector + 1.0 * mean_frontier BCE(err_head)
+  # Selector/error numerators share the globally reduced base denominator. This is invariant to
+  # the 7-rank x 2-microbatch partition; local selector/frontier means are not.
   dflash2_selector_loss_alpha: 1.0
   dflash2_selector_err_loss_alpha: 1.0
-  # Average the selector CE over covered slots, making it a plain mean CE over {supervised slots
-  # whose target is in the top-k} and keeping the three terms' relative weight independent of top-k
-  # recall.
-  dflash2_selector_own_denominator: true
+  # Must remain false under DDP/gradient accumulation; tune the two alpha values for relative scale.
+  dflash2_selector_own_denominator: false
+  # Weight the selector's CE per covered slot UNIFORMLY, not by the base objective's weights.
+  #
+  # This is not cosmetic. Under `loss_type: dpace` the base objective's `loss_weights` is
+  # `weight_mask * dpace_weights` (dflash_family_model.py:687-693), and the selector CE used to
+  # inherit it. Stage-1 trains under a plain mean CE over covered slots
+  # (scripts/train_pspr_accept_selector.py), so loading the stage-1 checkpoint into the old default
+  # changed the objective its weights were optimal for at the exact moment of the warm start -- which
+  # is the one thing a warm start exists to prevent. `uniform` makes stage-2's selector loss
+  # numerically identical to stage-1's (verified exactly by scripts/gate_pspr_selector_weight_mode.py
+  # W3 for a single batch). The globally aggregated objective intentionally shares the base
+  # denominator; selector_loss telemetry remains the global selector numerator/support ratio.
+  #
+  # This changes only the SELECTOR's weighting. The backbone keeps full D-PACE, which is the point of
+  # having a separate knob rather than reverting loss_type to "dflash".
+  dflash2_selector_weight_mode: uniform
   dflash2_selector_warmup_ratio: 0.0
   dflash2_selector_ramp_ratio: 0.0
   # MUST be false: stopping the gradient at the unary/backbone boundary is exactly what would make
@@ -129,11 +191,12 @@ training:
   dflash2_selector_target_greedy_labels: false
 
   # A crashed run can recover the consumer but cannot rewind the producer, so checkpoint often.
-  # 6 epochs at global 28 is 42857 steps, so the old interval of 200 would emit 214 x 7.5 GB = 1.6 TB
-  # and pay that NFS write 214 times. 1000 keeps 42 checkpoints (315 GB) and still places the first
-  # one at 28k samples -- earlier, in samples, than the step-200 checkpoint that caught the previous
-  # run's collapse at global 112 (22.4k samples).
-  save_interval: 1000
+  # 200 is chosen from evidence, not habit: iteration AG's one-shot collapse was already fully
+  # visible at step 200 (6.040 -> 4.374), so this is the interval at which the pilot's decisive
+  # measurement exists -- and S2 raises the backbone rate 20x, which is exactly when that pilot
+  # matters most. Three passes at 21352 steps emits 107 checkpoints at 7.9 GB each (~845 GB) against
+  # 32 TB free; stale ones are pruned by hand once a later checkpoint has been shown to dominate.
+  save_interval: 200
   log_interval: 10
   dist_timeout: 30
   seed: 42

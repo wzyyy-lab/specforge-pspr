@@ -1,0 +1,186 @@
+# PSPR-Decision: factorised keep/repair on the frozen official DFlash-b16 backbone, PerfectBlend
+# online.  Same pipeline, data, optimiser and step budget as qwen3-4b-pspr-cloze.yaml, so the moving
+# variables are exactly: the head's internals, the selector objective, and the decode rule.
+#
+# What the measurements said (six domains, n=20; see TAPS-SP/PSPR_DECISION.md for the full tables)
+# -----------------------------------------------------------------------------------------------
+# 1. Cross-slot attention is not where the value is.  Inference-time ablations of the same trained
+#    cloze@7115 weights: removing the FUTURE costs 0.0012, removing ALL cross-slot information costs
+#    0.0445, zeroing the encoder output costs 0.5086.  So ~91% of the encoder path was a per-slot
+#    non-linear transform, bought at 8.63 ms/block against v2's 6.16.  This head replaces the
+#    H*(H+1) attention with a per-slot residual tower plus one attention-free block-mean broadcast.
+#
+# 2. The bottleneck is the KEEP-vs-REPAIR decision.  On reachable decisions with fixable_n=5789
+#    (base top-1 wrong AND target inside top-16): the target is ranked #1 among the 15 ALTERNATIVES
+#    66.86% of the time, #1 among all 16 candidates only 44.05%, and is actually repaired 36.71%.
+#    The ordering ability exists; a joint 16-way softmax discards half of it, because multiclass CE
+#    is supervised only where the target is in top-16 and 77.4% of those labels are class 0.
+#
+# 3. So: `profitable_repair`.  The detector learns P(a usable repair exists) and the scorer learns
+#    P(which alternative | a repair exists), normalised WITHOUT candidate 0.  The decode rule is the
+#    MAP action of that same likelihood, so tau/rho/theta all disappear.
+#
+# Baselines on THIS hardware, all n=20 (the 141GB cards give different float results from the 96GB
+# cards -- pure-backbone oneshot moved 6.007 -> 5.827 with no head in the loop -- so old numbers are
+# NOT comparable and were re-measured):
+#   oneshot (frozen backbone, no head)   macro 5.3043
+#   official Domino (H=15, n=20)         macro 5.8868
+#   PSPR-cloze @7115, gate rho=3         macro 6.0498   <- the number this run must clear
+#   oracle@16 on the same fixed lattice  macro 10.4422  <- the ceiling any top-16 selector can reach
+#
+# Note on the old "Domino 6.4255": that figure mixed n=40 (gsm8k, math500, mbpp, alpaca) with n=20
+# (humaneval, mt-bench) while every PSPR number was pure n=20, so it was never a valid comparison.
+
+model:
+  target_model_path: /kl_infra_infer_intern/wangzhuoyu/TAPS-SP/models/Qwen3-4B
+  draft_model_config: configs/qwen3-4b-pspr-decision.json
+  # Official DFlash-b16: 58 backbone tensors, no selector tensors.  PSPRDecisionDraftModel declares
+  # `candidate_selector.` as an optional warm-start prefix, so the head stays at its zero-init no-op
+  # (delta == 0 AND the detector's output layer zeroed => the MAP action is KEEP at every slot =>
+  # predictions identical to plain DFlash at step 0) while the backbone loads warm and is then frozen
+  # by `freeze_backbone: true` in the draft config.
+  draft_checkpoint_path: /kl_infra_infer_intern/wangzhuoyu/TAPS-SP/models/Qwen3-4B-DFlash-b16
+  target_backend: sglang
+  embedding_key: model.embed_tokens.weight
+  torch_dtype: bfloat16
+  mask_token_id: 151669
+  sglang_context_length: 3200
+
+data:
+  train_data_path: ./cache/dataset/perfectblend_qwen3-4b_regen.jsonl
+  max_length: 3072
+  # Evaluation renders a bare user turn, so do not inject a system message.
+  chat_template: qwen-nosys
+  cache_dir: ./cache
+  build_dataset_num_proc: 32
+
+training:
+  strategy: dflash
+  num_epochs: 1
+  batch_size: 2
+  accumulation_steps: 2
+  fsdp_sharding: "NO_SHARD"
+
+  # Unchanged from cloze: only the head trains (the backbone carries requires_grad=False from
+  # apply_backbone_freeze), the head is no wider than cloze's, and cloze's grad-norm trace stayed in
+  # 0.07-0.76 against a clip of 1.0 -- never binding, so there is no evidence this rate is too high.
+  learning_rate: 5.0e-4
+  # Same reasoning as cloze and the same value: this is a deep pre-LN residual stack whose output
+  # layer (`delta_w2`) is zero-initialised, so the upstream gradient is exactly zero on step 1 and
+  # the tower cannot start learning until W2 has grown.  The detector's output layer is zeroed too,
+  # which adds a second such path.
+  warmup_ratio: 0.06
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  weight_decay_rules:
+    # `match()` scans rules sorted by DESCENDING prefix length and returns the first hit, and it
+    # matches on `name.startswith(prefix) or f".{prefix}" in name`.  There is deliberately NO
+    # catch-all: `training.weight_decay: 0.0` is what every unlisted parameter falls through to, and
+    # only two-dimensional weight matrices are listed.  A catch-all such as `candidate_selector.`
+    # would shadow every shorter rule and decay all the LayerNorm weights and biases as well.
+    # Verified exhaustively by scripts/gate_pspr_decision_decay.py: every dim()>=2 tensor matches a
+    # rule, every LayerNorm/bias matches none.
+    "h_in.weight": 2.0e-3
+    "tok_in.weight": 2.0e-3
+    "conf_in.weight": 2.0e-3
+    "lp_in.weight": 2.0e-3
+    "ctx_in.weight": 2.0e-3
+    "pos_emb": 2.0e-3
+    # One rule per residual-tower role; `.up.weight` / `.down.weight` match every tower layer.
+    "up.weight": 2.0e-3
+    "down.weight": 2.0e-3
+    "weight_ih_l0": 2.0e-3
+    "weight_hh_l0": 2.0e-3
+    "delta_w1.weight": 2.0e-3
+    "delta_w2.weight": 2.0e-3
+    "err_seed_in.weight": 2.0e-3
+    # err_head = Sequential(LayerNorm, Linear, GELU, Dropout, Linear, GELU, Dropout, Linear)
+    "err_head.1.weight": 2.0e-3
+    "err_head.4.weight": 2.0e-3
+    "err_head.7.weight": 2.0e-3
+
+  attention_backend: flex_attention
+  num_anchors: 512
+  # cloze needed 64 because its encoder materialised H rows of H+1 cells per block (peak 67.5 GiB of
+  # 96).  This head has no such expansion -- the tower is one cell per slot -- and the cards are now
+  # 141 GiB, so the chunk goes back to v2's 128.  This is only the gradient-checkpointing
+  # granularity; total FLOPs are unchanged.
+  objective_chunk_blocks: 128
+
+  # Backbone objective.  The backbone is frozen, so this term produces no gradient; it is retained
+  # only because the lattice is read off `objective_logits` and its telemetry tracks whether the
+  # frozen feature stream is what stage-1 measured.
+  loss_type: dpace
+  dpace_alpha: 0.5
+  lk_loss_type: lambda
+  kl_scale: 1.0
+  kl_decay: 1.0
+
+  # The factorised objective.  `profitable_repair` is the one that matches the deployed question:
+  #
+  #   detector label   repair_is_covered = (target is one of candidates 1..K-1)
+  #   scorer label     which alternative, conditional on repair_is_covered
+  #
+  # Three defects of `multiclass` are fixed at once:
+  #   * the ~21% of slots whose target falls outside top-16 were DROPPED entirely
+  #     (`selector_supervised = target_is_candidate`); here they are supervised, as negatives for the
+  #     detector, which is exactly the action the lattice can execute there (KEEP);
+  #   * the historical standalone err BCE label was `~base_top1_ok`, which fires on those same
+  #     unrepairable slots -- ~15.6% of its positives were targets it could never act on;
+  #   * the alternatives are now normalised WITHOUT candidate 0, so the 77.4% class-0 prior can no
+  #     longer suppress the ranking (the measured 66.86% -> 44.05% collapse).
+  dflash2_selector_objective: profitable_repair
+  # Uniform coverage plus extra weight on the slot the metric is actually decided at.  boost=0 is
+  # bit-identical to `uniform`.  At boost=3 the frontier carries ~22% of a block's selector weight
+  # against 6.7% under uniform.  Kept at cloze's value so this is not a second moving variable.
+  dflash2_selector_weight_mode: uniform_frontier_boost
+  dflash2_selector_frontier_boost: 3.0
+  dflash2_selector_loss_alpha: 1.0
+  # MUST be 0.  Under a factorised objective the detector is already trained inside `selector_ce`
+  # (binary_ce with the `repair_is_covered` label).  The standalone err objective would apply a
+  # SECOND, contradictory label (`~base_top1_ok`) to the very same logit.
+  dflash2_selector_err_loss_alpha: 0.0
+  # Must remain false: a local selector mean changes with rank/microbatch partitioning.
+  dflash2_selector_own_denominator: false
+  dflash2_selector_warmup_ratio: 0.0
+  dflash2_selector_ramp_ratio: 0.0
+  dflash2_selector_stop_gradient: false
+  dflash2_selector_target_greedy_labels: false
+
+  save_interval: 200
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+
+tracking:
+  report_to: tensorboard
+
+runtime:
+  producer_lease: 8
+  producer_concurrency: 2
+  in_flight_high_watermark: 256
+  in_flight_low_watermark: 192
+
+run_id: qwen3-4b-pspr-decision
+output_dir: ./outputs/qwen3-4b-pspr-decision
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 7
+  disaggregated:
+    control_dir: outputs/qwen3-4b-pspr-decision/control
+    consumer_state_dir: outputs/qwen3-4b-pspr-decision/consumer-state
+    backend: mooncake
+    managed_local:
+      trainer_cuda_visible_devices: ["1", "2", "3", "4", "5", "6", "7"]
+      mooncake:
+        protocol: tcp
+        global_segment_size_bytes: 34359738368
+        local_buffer_size_bytes: 2147483648
+      capture_servers:
+        - port: 30000
+          cuda_visible_devices: ["0"]
+          tp_size: 1
+          mem_fraction_static: 0.5

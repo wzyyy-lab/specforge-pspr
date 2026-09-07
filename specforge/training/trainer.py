@@ -331,7 +331,16 @@ class Trainer:
                             "not expose a recoverable horizon; the restored "
                             "optimizer schedule cannot be proven to match this run"
                         )
-                if key in custom_checkpoint_extra and key not in state:
+                if key == "pspr_slotdeep_training_extension_v1" and not persisted_available:
+                    from specforge.algorithms.dflash.providers import SLOTDEEP_LEGACY_TRAINING_EXTENSION
+
+                    # The extension did not exist in old SlotDeep runs. Only the
+                    # exact inactive legacy behavior is unambiguous; enabled losses
+                    # or lossless FP32 assembly require an explicitly recorded state.
+                    if current == SLOTDEEP_LEGACY_TRAINING_EXTENSION:
+                        comparison_persisted = dict(SLOTDEEP_LEGACY_TRAINING_EXTENSION)
+                        persisted_available = True
+                if key in custom_checkpoint_extra and not persisted_available:
                     raise ValueError(
                         f"checkpoint {resume_from} does not record required "
                         f"algorithm resume semantic {key}; start a fresh run "

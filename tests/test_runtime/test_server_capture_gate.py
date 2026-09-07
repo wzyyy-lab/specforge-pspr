@@ -425,6 +425,68 @@ class TestServerCaptureGate(unittest.TestCase):
         )
         store.release(handle)
 
+    def test_slotdeep_candidate_teacher_alignment(self):
+        """Opt-in DFlash transport carries post-norm p-1 teacher labels only."""
+        from pathlib import Path
+        from specforge.application import resolve_run
+        from specforge.config import load_config
+        from specforge.algorithms.common.dflash_family_model import (
+            gather_selector_teacher_hidden,
+        )
+        from specforge.inference.adapters.server_capture import (
+            SGLangServerCaptureAdapter, ServerCaptureSchema,
+        )
+        from specforge.inference.capture import CaptureConfig
+        from specforge.modeling.target.target_head import TargetHead
+        from specforge.runtime.contracts import SampleRef
+
+        root = Path(__file__).resolve().parents[2]
+        cfg = load_config(str(root / "examples/configs/online/disaggregated/managed-local/qwen3-4b-pspr-slotdeep.yaml"))
+        cfg.training.dflash2_selector_objective = "candidate_distill"
+        registration = resolve_run(cfg).algorithm
+        provider = registration.providers.server_streaming_for("text")
+        layout = provider.layout
+        feature_contract = registration.spec.feature_contract("streaming", "text")
+        self.assertEqual(provider.capture_method, "dflash")
+        rows = [[3, 1, 4, 1, 5, 9]]
+        store = self._store("gate-slotdeep-teacher")
+        adapter = SGLangServerCaptureAdapter(
+            f"http://localhost:{PORT}", store, run_id="gate-kd", algorithm="dflash",
+            schema=ServerCaptureSchema(aux_feature=layout.aux_feature,
+                last_hidden_feature=layout.last_hidden_feature,
+                passthrough=layout.passthrough,
+                attention_mask_feature=layout.attention_mask_feature),
+        )
+        contract = CaptureConfig.from_strategy(
+            required_features=feature_contract.required_tensors,
+            aux_hidden_state_layer_ids=tuple(AUX_LAYER_IDS),
+            target_repr=provider.target_representation, target_hidden_size=H,
+        )
+        (ref,) = adapter.produce_refs(self._tasks(rows), capture=contract)
+        self.assertIsInstance(ref, SampleRef, f"expected a ref, got: {ref}")
+        out, handle = store.get(ref)
+        try:
+            self.assertEqual(set(out), {"input_ids", "loss_mask", "hidden_states", "target_last_hidden_states"})
+            aux_ref, logits_ref = self._hf_reference(rows)
+            torch.testing.assert_close(out["hidden_states"].float(), aux_ref[0].float(), rtol=TOL, atol=TOL)
+            self.assertEqual(out["target_last_hidden_states"].shape, (1, 6, H))
+            head = TargetHead.from_pretrained(self.target_dir)
+            teacher = out["target_last_hidden_states"].cuda()
+            with torch.no_grad():
+                torch.testing.assert_close(head(teacher).cpu().float(), logits_ref[0].float(), rtol=TOL, atol=TOL)
+                positions = torch.tensor([[[1, 3, 5]]], device="cuda")
+                aligned = gather_selector_teacher_hidden(teacher, positions)
+                candidates = torch.tensor([[[[2, 4, 6], [1, 5, 9], [3, 7, 11]]]], device="cuda")
+                weight = head.fc.weight[candidates].float()
+                projected = torch.einsum("bahd,bahkd->bahk", aligned.float(), weight)
+                hf_selected = logits_ref[0].cuda()[:, [0, 2, 4]].unsqueeze(1).gather(-1, candidates).float()
+                torch.testing.assert_close(projected, hf_selected, rtol=TOL, atol=TOL)
+            batch = provider.build_collator()([out])
+            self.assertEqual(batch["target_last_hidden_states"].shape, (1, 6, H))
+            print("SLOTDEEP_LIVE_TEACHER_WITNESS", tuple(projected.shape), "post_norm_p_minus_one", flush=True)
+        finally:
+            store.release(handle)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

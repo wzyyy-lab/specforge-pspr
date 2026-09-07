@@ -463,6 +463,20 @@ def warm_start_draft_model(
         if not absent or any(key.startswith(prefix) for key in state):
             continue
         allowed_missing |= absent
+    # Some architecture revisions add one tightly-coupled parameter group to an
+    # otherwise complete head (for example PSPR's predecessor/successor
+    # transition factors).  Such a revision cannot use the prefix exemption
+    # above: the rest of the head is deliberately present in the source.  Allow
+    # a model to declare exact all-or-nothing groups while retaining the same
+    # fail-closed property.  A partially saved group remains an error.
+    for group in tuple(getattr(model, "warm_start_optional_key_groups", ())):
+        group = frozenset(group)
+        if not group:
+            raise ValueError("warm_start_optional_key_groups may not contain an empty group")
+        absent = group & set(result.missing_keys)
+        present = group & set(state)
+        if absent == group and not present:
+            allowed_missing |= absent
     required_missing = sorted(set(result.missing_keys) - allowed_missing)
     if required_missing:
         raise ValueError(

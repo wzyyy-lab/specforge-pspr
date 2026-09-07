@@ -467,22 +467,39 @@ class DFlashTrainStrategy(DraftTrainStrategy):
     def _device(self) -> torch.device:
         return next(self.dflash_model.parameters()).device
 
+    def _model_scalar(self, name: str, default: float) -> float:
+        """Read a scalar objective knob off the model, seeing through the DDP wrapper.
+
+        ``build_step`` is handed the *wrapped* module. FSDP defines ``__getattr__`` to forward
+        unknown names to ``_fsdp_wrapped_module``, but ``DistributedDataParallel`` does not, so
+        under ``fsdp_sharding: NO_SHARD`` (which ``backend.py`` maps to DDP) a plain ``getattr``
+        falls through to the default. For ``selector_loss_alpha`` that default is 0.0, which drops
+        the selector CE from the loss with no error and no warning -- the objective silently
+        becomes backbone-only. Resolve through ``.module`` the way the EAGLE3 branch above does.
+        """
+        module = self.dflash_model
+        for _ in range(4):
+            if hasattr(module, name):
+                return float(getattr(module, name))
+            inner = getattr(module, "module", None)
+            if inner is None:
+                break
+            module = inner
+        return float(default)
+
     def _selector_loss_alpha(self, ctx: Optional[StepContext]) -> float:
-        target = float(getattr(self.dflash_model, "selector_loss_alpha", 0.0))
+        target = self._model_scalar("selector_loss_alpha", 0.0)
         if target <= 0 or ctx is None or not ctx.total_steps:
             return target
 
         total_steps = int(ctx.total_steps)
         warmup_steps = int(
-            total_steps
-            * float(getattr(self.dflash_model, "selector_warmup_ratio", 0.0))
+            total_steps * self._model_scalar("selector_warmup_ratio", 0.0)
         )
         if ctx.global_step < warmup_steps:
             return 0.0
 
-        ramp_steps = int(
-            total_steps * float(getattr(self.dflash_model, "selector_ramp_ratio", 0.0))
-        )
+        ramp_steps = int(total_steps * self._model_scalar("selector_ramp_ratio", 0.0))
         if ramp_steps <= 0:
             return target
         ramp_progress = min(
@@ -504,6 +521,10 @@ class DFlashTrainStrategy(DraftTrainStrategy):
         target_greedy = t.get("target_greedy")
         if target_greedy is not None:
             target_greedy = target_greedy.to(device, non_blocking=True)
+        teacher_kwargs = {}
+        if "target_last_hidden_states" in t:
+            teacher_kwargs["target_last_hidden_states"] = t["target_last_hidden_states"].to(
+                device, non_blocking=True)
         loss, accuracy, model_metrics = self.dflash_model(
             input_ids=t["input_ids"].to(device, non_blocking=True),
             hidden_states=t["hidden_states"].to(device, non_blocking=True),
@@ -511,6 +532,7 @@ class DFlashTrainStrategy(DraftTrainStrategy):
             max_valid_anchors=max_valid_anchors,
             selector_loss_alpha=selector_loss_alpha,
             target_greedy=target_greedy,
+            **teacher_kwargs,
         )
         metrics = {"accuracy": accuracy.detach()}
         if "accuracy_denom" in model_metrics:

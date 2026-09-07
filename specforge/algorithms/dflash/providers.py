@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from functools import partial
+from dataclasses import replace
 
 from specforge.algorithms.common.defaults import (
     empty_options,
@@ -12,6 +13,7 @@ from specforge.algorithms.common.hidden_states_data import (
     NORMALIZER_ID,
     TARGET_GREEDY_KEY,
     build_collator,
+    build_dspark_collator,
     build_offline_normalizer,
     build_offline_reader,
 )
@@ -39,10 +41,44 @@ from specforge.data.loss_mask import has_consecutive_supervised_tokens
 
 ALGORITHM_NAME = "dflash"
 DRAFT_ARCHITECTURE = "DFlashDraftModel"
+SLOTDEEP_TRAINING_EXTENSION_KEY = "pspr_slotdeep_training_extension_v1"
+# Only this exact inactive/default contract may be supplied for a legacy checkpoint.
+# New checkpoints always record it, including all-zero arms, so disabling an active
+# loss on resume cannot silently evade the contract comparison.
+SLOTDEEP_LEGACY_TRAINING_EXTENSION = {
+    "alt_loss_alpha": 0.0, "safe_loss_alpha": 0.0, "repair_loss_alpha": 0.0,
+    "safe_margin": 0.1, "repair_margin": 0.1, "preserve_fp32": False,
+}
 DFLASH2_DRAFT_ARCHITECTURE = "DFlash2DraftModel"
 PSPR_DRAFT_ARCHITECTURE = "PSPRDraftModel"
+# PSPR-v2 is the same DFlash backbone with a different selector head, so it trains under the same
+# `dflash` strategy; only the candidate_selector module differs.
+PSPR_V2_DRAFT_ARCHITECTURE = "PSPRv2DraftModel"
+# Same story for PSPR-cloze: identical backbone and identical selector contract, only the
+# candidate_selector's internals differ.
+PSPR_CLOZE_DRAFT_ARCHITECTURE = "PSPRClozeDraftModel"
+# PSPR-cascade is PSPR-cloze with one structural change: the keep/repair gate reads the ranker's
+# corrected scores, which the cloze gate is blind to.  Same backbone, same selector contract.
+PSPR_CASCADE_DRAFT_ARCHITECTURE = "PSPRCascadeDraftModel"
+# And for PSPR-Decision: same frozen backbone, same selector contract; it replaces the
+# cross-slot encoder with a per-slot residual tower and factorises the keep/repair decision.
+PSPR_DECISION_DRAFT_ARCHITECTURE = "PSPRDecisionDraftModel"
+# PSPR-slotdeep is PSPR-cloze with the dense bidirectional encoder replaced by a deep per-slot
+# readout.  It subclasses PSPRClozeDraftModel and overrides one method (`cloze_states`), so the
+# backbone, the selector contract and every objective term are inherited unchanged.
+PSPR_SLOTDEEP_DRAFT_ARCHITECTURE = "PSPRSlotDeepDraftModel"
 COMPATIBLE_DRAFT_ARCHITECTURES = frozenset(
-    {DRAFT_ARCHITECTURE, DFLASH2_DRAFT_ARCHITECTURE, PSPR_DRAFT_ARCHITECTURE}
+    {
+        DRAFT_ARCHITECTURE,
+        DFLASH2_DRAFT_ARCHITECTURE,
+        PSPR_DRAFT_ARCHITECTURE,
+        PSPR_V2_DRAFT_ARCHITECTURE,
+        PSPR_CLOZE_DRAFT_ARCHITECTURE,
+        "PSPRMemoryDraftModel",
+        PSPR_CASCADE_DRAFT_ARCHITECTURE,
+        PSPR_DECISION_DRAFT_ARCHITECTURE,
+        PSPR_SLOTDEEP_DRAFT_ARCHITECTURE,
+    }
 )
 
 
@@ -92,10 +128,25 @@ def resume_contract(_config, draft_model, training_model):
                     training_model.selector_loss_alpha
                 ),
                 "dflash2_selector_err_loss_alpha": float(
-                    training_model.selector_err_loss_alpha
+                    getattr(training_model, "selector_err_loss_alpha", 0.0)
                 ),
                 "dflash2_selector_own_denominator": bool(
-                    training_model.selector_own_denominator
+                    getattr(training_model, "selector_own_denominator", False)
+                ),
+                "dflash2_selector_weight_mode": str(
+                    getattr(training_model, "selector_weight_mode", "base_dpace")
+                ),
+                "dflash2_selector_frontier_boost": float(
+                    getattr(training_model, "selector_frontier_boost", 0.0)
+                ),
+                "dflash2_selector_survival_floor": float(
+                    getattr(training_model, "selector_survival_floor", 0.5)
+                ),
+                "dflash2_selector_objective": str(
+                    getattr(training_model, "selector_objective", "multiclass")
+                ),
+                "dflash2_selector_err_weight_mode": str(
+                    getattr(training_model, "selector_err_weight_mode", "base_frontier")
                 ),
                 "dflash2_selector_warmup_ratio": float(
                     training_model.selector_warmup_ratio
@@ -107,10 +158,50 @@ def resume_contract(_config, draft_model, training_model):
                     training_model.selector_stop_gradient
                 ),
                 "dflash2_selector_target_greedy_labels": bool(
-                    training_model.selector_target_greedy_labels
+                    getattr(training_model, "selector_target_greedy_labels", False)
+                ),
+                # Serving-policy fields are semantic checkpoint state.  None
+                # of them changes a selector tensor shape, so strict state_dict
+                # loading cannot detect a changed gate or repair margin.
+                "dflash2_selector_decision_mode": str(
+                    getattr(draft_model, "selector_decision_mode", "margin_gate")
+                ),
+                "dflash2_selector_keep_repair_margin": float(
+                    getattr(draft_model, "selector_keep_repair_margin", 0.0)
+                ),
+                "dflash2_selector_gate_rho": float(
+                    getattr(draft_model, "selector_gate_rho", 1.0)
+                ),
+                "dflash2_selector_gate_tau": float(
+                    getattr(draft_model, "selector_gate_tau", 0.0)
+                ),
+                "dflash2_selector_gate_theta": float(
+                    getattr(draft_model, "selector_gate_theta", 0.0)
+                ),
+                "dflash2_selector_gate_skip_first": bool(
+                    getattr(draft_model, "selector_gate_skip_first", False)
+                ),
+                "dflash2_selector_compute_dtype": str(
+                    getattr(draft_model, "selector_compute_dtype", "model")
                 ),
             }
         )
+    selector = getattr(draft_model, "candidate_selector", None)
+    if selector is not None and type(selector).__name__ == "SlotDeepCorrector":
+        # Includes fusion/scoring semantics, not just tensor shapes. Old model
+        # contracts are untouched; a SlotDeep resume must use its exact head.
+        contract["pspr_slotdeep_reference_config"] = selector.reference_config()
+        contract[SLOTDEEP_TRAINING_EXTENSION_KEY] = {
+            name: getattr(training_model, "selector_" + name, default)
+            for name, default in SLOTDEEP_LEGACY_TRAINING_EXTENSION.items()
+        }
+        if getattr(training_model, "selector_objective", None) == "candidate_distill":
+            contract["pspr_slotdeep_candidate_distill_v1"] = {
+                "alpha": training_model.selector_distill_alpha,
+                "temperature": training_model.selector_distill_temperature,
+                "teacher_alignment": "post_norm_target_hidden_at_label_position_minus_one",
+                "support": "strict_draft_topk_conditional_distribution_all_valid_slots",
+            }
     return contract
 
 
@@ -288,6 +379,33 @@ def algorithm_providers() -> AlgorithmProviders:
 
 def create_registration():
     return make_registration(algorithm_spec(), algorithm_providers())
+
+
+def with_candidate_teacher(registration, config):
+    """Run-local online feature extension; defaults and old dumps are untouched.
+
+    SGLang's existing last_hidden artifact is post-final-norm. Reuse its tested
+    transport and the four-feature collator, without adding a new algorithm or
+    a new selector architecture. The extra tensor is strictly training labels.
+    """
+    if registration.name != ALGORITHM_NAME or config.mode != "online":
+        raise ValueError("candidate_distill currently requires online training.strategy='dflash'")
+    if config.model.input_modality != "text":
+        raise ValueError("candidate_distill currently requires text input")
+    contracts = tuple(
+        replace(c, required_tensors=c.required_tensors | {"target_last_hidden_states"},
+                allowed_target_representations={"hidden_state"},
+                default_target_representation="hidden_state")
+        if c.mode is FeatureMode.STREAMING else c
+        for c in registration.spec.feature_contracts
+    )
+    streaming = tuple(
+        replace(p, layout=replace(p.layout, last_hidden_feature="target_last_hidden_states"),
+                target_representation="hidden_state", build_collator=build_dspark_collator)
+        for p in registration.providers.server_streaming
+    )
+    return make_registration(replace(registration.spec, feature_contracts=contracts),
+                             replace(registration.providers, server_streaming=streaming))
 
 
 __all__ = ["algorithm_providers", "algorithm_spec", "create_registration"]

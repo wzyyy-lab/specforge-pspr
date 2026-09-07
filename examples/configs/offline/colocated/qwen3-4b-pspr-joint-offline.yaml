@@ -13,7 +13,13 @@ model:
 data:
   hidden_states_path: ./cache/hidden_states/sharegpt3k
   max_length: 3072
-  chat_template: qwen
+  # qwen-nosys, not qwen: the `qwen` template injects system_prompt="You are a helpful assistant."
+  # into every training sequence (specforge/data/parse.py:211-212), while the evaluator
+  # (TAPS-SP/scripts/decode_lattice.py:347) and the data regeneration both build the prompt from a
+  # bare user turn. Under `qwen` the draft is trained on a prefix that does not exist at deployment.
+  # Verified byte-identical to the tokenizer's own jinja output with the system turn removed, and
+  # loss_mask is unchanged.
+  chat_template: qwen-nosys
   cache_dir: ./cache
 
 training:
@@ -34,7 +40,10 @@ training:
   # with no decay at all.
   weight_decay: 2.0e-3
   lr_scale_rules:
-    # Longest matching prefix wins, so these are ordered specific -> general.
+    # Longest matching prefix wins, so these are ordered specific -> general for readability.
+    # The ordering is not load-bearing: assembly.py:277 sorts by descending prefix length before the
+    # optimizer sees them (optimizer.py's own matcher returns on first hit, which is why that sort
+    # exists). Anything constructing BF16Optimizer directly must replicate the sort.
     #
     # dh2048's second AdamW group. `gamma` starts at 0 and must reach ~1 before the head changes any
     # decision at all, so at the shared rate it is the slowest parameter in the model.
@@ -61,9 +70,9 @@ training:
   # dh2048: loss = 1.0 * CE(sc[ti>=0], ti[ti>=0]) + 1.0 * BCE(err_logits[frontier], ti != 0)
   dflash2_selector_loss_alpha: 1.0
   dflash2_selector_err_loss_alpha: 1.0
-  # Average the selector CE over covered slots, which is what turns it into a plain mean CE over
-  # {supervised slots whose target is in the top-k} -- exactly dh2048's `CE(sc[m], ti[m])`.
-  dflash2_selector_own_denominator: true
+  # Local covered-slot means are not partition-invariant under DDP/gradient accumulation; share the
+  # globally reduced base denominator and control the relative selector scale with its alpha.
+  dflash2_selector_own_denominator: false
   dflash2_selector_warmup_ratio: 0.0
   dflash2_selector_ramp_ratio: 0.0
   # MUST be false for joint training: stopping the gradient at the unary/backbone boundary is what

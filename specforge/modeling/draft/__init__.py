@@ -12,6 +12,12 @@ from .llama3_eagle import LlamaForCausalLMEagle3
 from .mtp import Qwen3_5MTPDraftModel
 from .peagle import PEagleDraftModel
 from .pspr import PSPRDraftModel
+from .pspr_cascade import PSPRCascadeDraftModel
+from .pspr_cloze import PSPRClozeDraftModel
+from .pspr_memory import PSPRMemoryDraftModel
+from .pspr_decision import PSPRDecisionDraftModel
+from .pspr_slotdeep import PSPRSlotDeepDraftModel
+from .pspr_v2 import PSPRv2DraftModel
 from .registry import DRAFT_REGISTRY, available_drafts, register_draft, resolve_draft
 
 __all__ = [
@@ -22,7 +28,13 @@ __all__ = [
     "DSparkDraftModel",
     "LlamaForCausalLMEagle3",
     "PEagleDraftModel",
+    "PSPRCascadeDraftModel",
+    "PSPRClozeDraftModel",
+    "PSPRMemoryDraftModel",
+    "PSPRSlotDeepDraftModel",
+    "PSPRDecisionDraftModel",
     "PSPRDraftModel",
+    "PSPRv2DraftModel",
     "Qwen3_5MTPDraftModel",
     "build_target_layer_ids",
     "extract_context_feature",

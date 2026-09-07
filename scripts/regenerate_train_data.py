@@ -211,12 +211,16 @@ def build_query_kwargs(args, messages, max_tokens=None):
     effective_max_tokens = max_tokens if max_tokens is not None else args.max_tokens
 
     query_messages = messages
-    if args.reasoning == "save":
+    if args.reasoning == "save" or getattr(args, "record_generation_metadata", False):
         query_messages = []
         for message in messages:
             query_message = dict(message)
             if query_message.get("role") == "assistant":
-                query_message.pop("reasoning_content", None)
+                if args.reasoning == "save":
+                    query_message.pop("reasoning_content", None)
+                # Provenance belongs in the saved dataset, not the chat API
+                # schema or subsequent model inputs. Plain answer text stays.
+                query_message.pop("generation", None)
             query_messages.append(query_message)
 
     query_kwargs = dict(
@@ -256,7 +260,11 @@ def call_sglang(
             "dataset regeneration requires the OpenAI client; install "
             "SpecForge's data extra with `pip install 'specforge[data]'`"
         ) from _OPENAI_IMPORT_ERROR
-    client = OpenAI(base_url=f"http://{server_address}/v1", api_key="None")
+    client_options = {}
+    # Opt-in for the ID-resumable driver; legacy CLI behavior is unchanged.
+    if getattr(args, "api_timeout", None) is not None:
+        client_options.update(timeout=args.api_timeout, max_retries=0)
+    client = OpenAI(base_url=f"http://{server_address}/v1", api_key="None", **client_options)
 
     messages = data["conversations"]
     regenerated_messages = []
@@ -297,6 +305,21 @@ def call_sglang(
                 "role": "assistant",
                 "content": response_text,
             }
+            if getattr(args, "record_generation_metadata", False):
+                finish_reason = resp.choices[0].finish_reason
+                if finish_reason not in ("stop", "length"):
+                    data["status"] = "error"
+                    data["error"] = f"Unexpected generation finish_reason: {finish_reason!r}"
+                    return data
+                usage = getattr(resp, "usage", None)
+                resp_msg["generation"] = {
+                    "finish_reason": finish_reason,
+                    "prompt_tokens": getattr(usage, "prompt_tokens", None),
+                    "completion_tokens": getattr(usage, "completion_tokens", None),
+                    "model": args.model,
+                    "temperature": args.temperature,
+                    "enable_thinking": args.reasoning != "disable",
+                }
             if args.reasoning == "save":
                 response_message = resp.choices[0].message
                 reasoning_content = getattr(response_message, "reasoning_content", None)

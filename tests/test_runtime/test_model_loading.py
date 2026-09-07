@@ -298,6 +298,30 @@ class _TinyDraft(torch.nn.Module):
         self.proj = torch.nn.Linear(3, 2)
 
 
+class _TinyDraftWithOptionalGroup(_TinyDraft):
+    warm_start_optional_key_groups = (("transition.left", "transition.right"),)
+
+    def __init__(self):
+        super().__init__()
+        self.transition = torch.nn.ParameterDict(
+            {
+                "left": torch.nn.Parameter(torch.randn(2, 2)),
+                "right": torch.nn.Parameter(torch.randn(2, 2)),
+            }
+        )
+
+
+class _TinyMixedPrecisionDraft(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone = torch.nn.Linear(2, 2, bias=False).to(torch.bfloat16)
+        self.candidate_selector = torch.nn.Linear(2, 2, bias=False).to(torch.bfloat16)
+        self.selector_compute_dtype = "float32"
+
+    def enforce_selector_compute_dtype(self):
+        self.candidate_selector.to(torch.float32)
+
+
 class WarmStartTest(unittest.TestCase):
     def _write_runtime_state(self, directory, state, *, strategy="dflash"):
         path = os.path.join(directory, "training_state.pt")
@@ -341,6 +365,33 @@ class WarmStartTest(unittest.TestCase):
         )
         self.assertTrue(load.call_args.kwargs["weights_only"])
 
+    def test_mixed_precision_selector_is_fp32_before_and_after_warm_start(self):
+        from specforge.algorithms import model_providers
+
+        destination = _TinyMixedPrecisionDraft()
+        exact = torch.tensor(
+            [[1.000123, -0.333271], [0.117431, -2.000321]],
+            dtype=torch.float32,
+        )
+
+        def fake_warm_start(_cfg, model, _draft_config):
+            self.assertEqual(model.candidate_selector.weight.dtype, torch.float32)
+            with torch.no_grad():
+                model.candidate_selector.weight.copy_(exact)
+
+        with (
+            mock.patch.object(model_providers, "_warm_start", side_effect=fake_warm_start),
+            mock.patch.object(model_providers, "_device", return_value=torch.device("cpu")),
+            mock.patch.object(model_providers, "_torch_dtype", return_value=torch.bfloat16),
+        ):
+            result = model_providers._finish_registered_draft(
+                object(), object(), destination
+            )
+
+        self.assertEqual(result.backbone.weight.dtype, torch.bfloat16)
+        self.assertEqual(result.candidate_selector.weight.dtype, torch.float32)
+        self.assertTrue(torch.equal(result.candidate_selector.weight, exact))
+
     def test_eagle_checkpoint_may_omit_target_copied_embedding(self):
         source = _TinyDraft()
         destination = _TinyDraft()
@@ -373,6 +424,50 @@ class WarmStartTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = self._write_runtime_state(directory, state)
             with self.assertRaisesRegex(ValueError, "missing draft weights"):
+                warm_start_draft_model(
+                    destination,
+                    path,
+                    draft_config=object(),
+                    strategy="dflash",
+                )
+
+    def test_exact_optional_key_group_may_be_entirely_absent(self):
+        source = _TinyDraft()
+        destination = _TinyDraftWithOptionalGroup()
+        original_transition = {
+            key: value.detach().clone()
+            for key, value in destination.transition.items()
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_runtime_state(directory, source.state_dict())
+            report = warm_start_draft_model(
+                destination,
+                path,
+                draft_config=object(),
+                strategy="dflash",
+            )
+        self.assertEqual(
+            set(report.missing_keys),
+            {"transition.left", "transition.right"},
+        )
+        self.assertTrue(
+            all(
+                torch.equal(destination.transition[key], value)
+                for key, value in original_transition.items()
+            )
+        )
+
+    def test_partial_optional_key_group_fails_closed(self):
+        source = _TinyDraftWithOptionalGroup()
+        destination = _TinyDraftWithOptionalGroup()
+        state = {
+            key: value.detach().clone()
+            for key, value in source.state_dict().items()
+            if key != "transition.right"
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._write_runtime_state(directory, state)
+            with self.assertRaisesRegex(ValueError, "transition.right"):
                 warm_start_draft_model(
                     destination,
                     path,
@@ -417,6 +512,7 @@ class WarmStartTest(unittest.TestCase):
             cache_dir="/cache",
             trust_remote_code=True,
             output_loading_info=True,
+            dtype=torch.float32,
         )
         self.assertTrue(torch.equal(destination.proj.weight, source.proj.weight))
 

@@ -1,0 +1,152 @@
+# SlotDeep updated IN PLACE at the user's request, 2026-09-05.
+# Online Stage 1: official DFlash frozen, WHOLE selector trained from scratch.
+# Improvements: concat anchor/query fusion and a candidate-conditioned nonlinear residual.
+# Baseline recipe is retained (covered CE + policy-frontier boost + auxiliary error BCE).
+# No claim that attention ablations decompose module value, or that MLP must improve acceptance.
+# Run six-domain paired decoding against the fixed cloze@7115 artifact in the same environment.
+# Use ordinary python with the established workload-scoped environment prefix:
+# OMP_NUM_THREADS=4 SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1 HF_HUB_OFFLINE=1
+# no_proxy=localhost,127.0.0.1 NO_PROXY=localhost,127.0.0.1
+# PYTHONPATH=/home/wangzhuoyu/sglang-patched-0.5.15:. python -u -m specforge.cli train -c THIS_FILE
+# The kernel-version override was validated for this capture path, not all SGLang features.
+
+model:
+  target_model_path: /kl_infra_infer_intern/wangzhuoyu/TAPS-SP/models/Qwen3-4B
+  draft_model_config: configs/qwen3-4b-pspr-slotdeep.json
+  # Official DFlash-b16: 58 backbone tensors, no selector tensors.  PSPRv2DraftModel declares
+  # `candidate_selector.` as an optional warm-start prefix, so the repairer stays at its zero-init
+  # no-op (delta == 0 => predictions identical to plain DFlash at step 0) while the backbone loads
+  # warm and is then frozen by `freeze_backbone: true` in the draft config.
+  draft_checkpoint_path: /kl_infra_infer_intern/wangzhuoyu/TAPS-SP/models/Qwen3-4B-DFlash-b16
+  target_backend: sglang
+  embedding_key: model.embed_tokens.weight
+  torch_dtype: bfloat16
+  mask_token_id: 151669
+  sglang_context_length: 3200
+
+data:
+  train_data_path: ./cache/dataset/perfectblend_qwen3-4b_regen.jsonl
+  max_length: 3072
+  # Evaluation renders a bare user turn, so do not inject a system message.
+  chat_template: qwen-nosys
+  cache_dir: ./cache
+  build_dataset_num_proc: 32
+
+training:
+  strategy: dflash
+  num_epochs: 1
+  batch_size: 2
+  accumulation_steps: 2
+  fsdp_sharding: "NO_SHARD"
+
+  # Matched to the completed cloze recipe; not asserted to be optimal for this new head.
+  learning_rate: 5.0e-4
+  # Zero-init blocks the correction outputs' upstream gradients only initially;
+  # the auxiliary error BCE already trains the slot tower on the first update.
+  warmup_ratio: 0.06
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  weight_decay_rules:
+    # Explicit matrix rules only; norms, biases and position/role embeddings are not decayed.
+    # Old encoder rules are inert and retained for the legacy SlotDeep comparison gate.
+    "in_proj_weight": 2.0e-3
+    "out_proj.weight": 2.0e-3
+    "linear1.weight": 2.0e-3
+    "linear2.weight": 2.0e-3
+    "fc1.weight": 2.0e-3
+    "fc2.weight": 2.0e-3
+    "anchor_fuse.weight": 2.0e-3
+    "rank_query_in.weight": 2.0e-3
+    "rank_query_out.weight": 2.0e-3
+    "rank_candidate_in.weight": 2.0e-3
+    "rank_features_in.weight": 2.0e-3
+    "rank_out.weight": 2.0e-3
+    "weight_ih_l0": 2.0e-3
+    "weight_hh_l0": 2.0e-3
+    "h_in.weight": 2.0e-3
+    "tok_in.weight": 2.0e-3
+    "conf_in.weight": 2.0e-3
+    "delta_w1.weight": 2.0e-3
+    "delta_w2.weight": 2.0e-3
+    "err_seed_in.weight": 2.0e-3
+    "err_head.1.weight": 2.0e-3
+    "err_head.4.weight": 2.0e-3
+
+  attention_backend: flex_attention
+  num_anchors: 512
+  # Retain the cloze chunk granularity. This is an architecture package comparison,
+  # not a single-variable ablation; parameterization and representation both changed.
+  objective_chunk_blocks: 64
+
+  # Backbone objective. The backbone is frozen, so this term produces no gradient; it is retained
+  # only because the lattice is read off `objective_logits` and its telemetry tracks whether the
+  # frozen feature stream is what stage-1 measured.
+  loss_type: dpace
+  dpace_alpha: 0.5
+  lk_loss_type: lambda
+  kl_scale: 1.0
+  kl_decay: 1.0
+
+  # Preserve the successful recipe while testing representation changes. This
+  # is a surrogate, not an exact expected-acceptance objective. Candidate misses
+  # receive error BCE but no K-way ranker CE. Full-vocab mode is not supported
+  # by the candidate-conditioned residual and is explicitly rejected.
+  dflash2_selector_objective: multiclass
+  # Uniform coverage plus extra weight on the slot the metric is actually decided at.
+  #
+  # `uniform` (what v2 trained under) spends the same capacity on all 15 slots, but accept length
+  # truncates at ONE of them: the first the selector gets wrong.  `teacher_forced_frontier` is the
+  # opposite extreme and zeroes everything past that slot, which starves precisely the non-frontier
+  # representations a cloze row reads as context.  `uniform_frontier_boost` keeps the whole uniform
+  # signal and multiplies the current first error by (1 + boost), so no slot loses supervision.
+  # boost=0 is bit-identical to `uniform`.  At boost=3 the frontier carries ~22% of a block's
+  # selector weight against 6.7% under uniform.
+  dflash2_selector_weight_mode: uniform_frontier_boost
+  dflash2_selector_frontier_boost: 3.0
+  dflash2_selector_loss_alpha: 1.0
+  # Auxiliary representation supervision. theta=0 at serving: detector is NOT a live gate.
+  dflash2_selector_err_loss_alpha: 1.0
+  # Must remain false: a local selector mean changes with rank/microbatch partitioning.
+  dflash2_selector_own_denominator: false
+  dflash2_selector_warmup_ratio: 0.0
+  dflash2_selector_ramp_ratio: 0.0
+  dflash2_selector_stop_gradient: false
+  dflash2_selector_target_greedy_labels: false
+
+  save_interval: 1000
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+
+tracking:
+  report_to: tensorboard
+
+runtime:
+  producer_lease: 8
+  producer_concurrency: 2
+  in_flight_high_watermark: 256
+  in_flight_low_watermark: 192
+
+run_id: qwen3-4b-pspr-slotdeep-s1-20260905
+output_dir: ./outputs/qwen3-4b-pspr-slotdeep-s1-20260905
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 7
+  disaggregated:
+    control_dir: outputs/qwen3-4b-pspr-slotdeep-s1-20260905/control
+    consumer_state_dir: outputs/qwen3-4b-pspr-slotdeep-s1-20260905/consumer-state
+    backend: mooncake
+    managed_local:
+      trainer_cuda_visible_devices: ["1", "2", "3", "4", "5", "6", "7"]
+      mooncake:
+        protocol: tcp
+        global_segment_size_bytes: 34359738368
+        local_buffer_size_bytes: 2147483648
+      capture_servers:
+        - port: 30000
+          cuda_visible_devices: ["0"]
+          tp_size: 1
+          mem_fraction_static: 0.5

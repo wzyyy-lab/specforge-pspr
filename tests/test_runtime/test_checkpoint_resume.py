@@ -641,6 +641,46 @@ class TestTrainerResumeEntrypoint(unittest.TestCase):
                 strategy_kwargs=changed_optional_runtime,
             )
 
+    def test_slotdeep_extension_legacy_default_and_disable_are_validated(self):
+        from specforge.algorithms.common.providers import StepRuntimeConfig
+        from specforge.algorithms.dflash.providers import (
+            SLOTDEEP_LEGACY_TRAINING_EXTENSION, SLOTDEEP_TRAINING_EXTENSION_KEY,
+        )
+
+        workdir = tempfile.mkdtemp(prefix="slotdeep_resume_extension_")
+        features = _write_feature_files(os.path.join(workdir, "features"), n=4)
+        def runtime(extension):
+            return StepRuntimeConfig(options={},
+                resume_contract={SLOTDEEP_TRAINING_EXTENSION_KEY: dict(extension)},
+                allowed_missing_checkpoint_keys=frozenset())
+
+        # A real saved legacy checkpoint lacks the extension. Only the exact
+        # old behavior may fill that missing semantic, not an enabled loss.
+        legacy_runtime = StepRuntimeConfig(
+            options={}, resume_contract={},
+            allowed_missing_checkpoint_keys=frozenset(),
+        )
+        legacy, _, _ = self._make_trainer(os.path.join(workdir, "legacy"),
+            feat_dir=features, max_steps=1, strategy_kwargs=legacy_runtime)
+        self.assertEqual(legacy.fit(), 1)
+        checkpoint = os.path.realpath(os.path.join(workdir, "legacy", "rz-latest"))
+        default = dict(SLOTDEEP_LEGACY_TRAINING_EXTENSION)
+        resumed, _, _ = self._make_trainer(os.path.join(workdir, "default"),
+            feat_dir=features, max_steps=2, resume_from=checkpoint, strategy_kwargs=runtime(default))
+        self.assertEqual(resumed._controller.global_step, 1)
+        enabled = {**default, 'alt_loss_alpha': .5, 'preserve_fp32': True}
+        with self.assertRaisesRegex(ValueError, "does not record required algorithm resume semantic"):
+            self._make_trainer(os.path.join(workdir, "invalid_legacy"), feat_dir=features,
+                max_steps=2, resume_from=checkpoint, strategy_kwargs=runtime(enabled))
+
+        active, _, _ = self._make_trainer(os.path.join(workdir, "active"), feat_dir=features,
+            max_steps=1, strategy_kwargs=runtime(enabled))
+        self.assertEqual(active.fit(), 1)
+        checkpoint = os.path.realpath(os.path.join(workdir, "active", "rz-latest"))
+        with self.assertRaisesRegex(ValueError, SLOTDEEP_TRAINING_EXTENSION_KEY):
+            self._make_trainer(os.path.join(workdir, "disabled"), feat_dir=features,
+                max_steps=2, resume_from=checkpoint, strategy_kwargs=runtime(default))
+
     def test_direct_builder_requires_bound_provenance_for_omitted_embedding(self):
         from types import SimpleNamespace
 

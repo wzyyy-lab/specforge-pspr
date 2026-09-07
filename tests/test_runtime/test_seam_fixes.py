@@ -160,6 +160,7 @@ class _FakeDFlashModel(nn.Module):
         loss_mask,
         max_valid_anchors=None,
         selector_loss_alpha=None,
+        target_greedy=None,
     ):
         # mirrors OnlineDFlashModel's (loss, accuracy, metrics) contract
         self.max_valid_anchors = max_valid_anchors

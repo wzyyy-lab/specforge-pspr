@@ -61,9 +61,15 @@ from specforge.data.lattice_trace_data import (  # noqa: E402
 )
 from specforge.modeling.draft.pspr import LatticePathSelector  # noqa: E402
 
-# ``delta_mlp`` is the port's name for the reference's ``dh_mlp``; ``gamma`` is 1-D here (FSDP
-# rejects zero-dim parameters) and a 0-D scalar in the reference.
-PORT_TO_REFERENCE = {"delta_mlp.": "dh_mlp."}
+# Names deliberately differ between the SpecForge port and the external
+# reference selector.  Keep every optional branch in this mapping: otherwise a
+# transition-enabled checkpoint can appear to save successfully but cannot be
+# loaded by the decode harness that produced the comparison numbers.
+PORT_TO_REFERENCE = {
+    "delta_mlp.": "dh_mlp.",
+    "predecessor_codebook": "trans_pred",
+    "successor_codebook": "trans_succ",
+}
 SCALAR_IN_REFERENCE = {"gamma"}
 
 

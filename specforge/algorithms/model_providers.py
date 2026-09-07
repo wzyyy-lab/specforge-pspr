@@ -154,7 +154,26 @@ def _finish_registered_draft(
     draft_config: PretrainedConfig,
     draft_model: Any,
 ):
+    # ``AutoDraftModel.from_config(..., torch_dtype=bf16)`` has already cast
+    # the newly built model.  A PSPR selector configured for fp32 must be
+    # restored *before* warm-start loading: loading fp32 checkpoint values into
+    # bf16 parameters and only up-casting afterwards irreversibly rounds the
+    # checkpoint while still making the final module look fp32.  Likewise, do
+    # not run a second parent dtype cast after loading, or the exact same loss
+    # happens a second time.  A device-only move preserves the intentionally
+    # mixed backbone/selector dtypes.
+    preserve_selector_fp32 = (
+        hasattr(draft_model, "enforce_selector_compute_dtype")
+        and str(getattr(draft_model, "selector_compute_dtype", "model"))
+        == "float32"
+    )
+    if preserve_selector_fp32:
+        draft_model.enforce_selector_compute_dtype()
     _warm_start(cfg, draft_model, draft_config)
+    if preserve_selector_fp32:
+        draft_model = draft_model.to(device=_device())
+        draft_model.enforce_selector_compute_dtype()
+        return draft_model
     return draft_model.to(device=_device(), dtype=_torch_dtype(cfg))
 
 
@@ -373,7 +392,22 @@ def _build_dflash_family_model(
         "loss_decay_gamma": cfg.training.loss_decay_gamma,
         "objective_chunk_blocks": cfg.training.objective_chunk_blocks,
     }
-    model = model_factory(common).to(device=_device(), dtype=_torch_dtype(cfg))
+    model = model_factory(common)
+    if (getattr(getattr(draft_model, "candidate_selector", None), "requires_verified_memory", False)
+            or getattr(model, "selector_preserve_fp32", False)):
+        # PSPR-Memory freezes a mature FP32 scorer byte-for-byte. _finish_registered_draft
+        # already placed the backbone in bf16 and restored the selector before warm loading.
+        # Casting the whole wrapper to bf16 here, then back to fp32 below, irreversibly
+        # rounds those loaded weights. Preserve mixed dtypes for this opt-in architecture.
+        # Keep legacy behavior unchanged so old experiment recipes remain reproducible.
+        model = model.to(device=_device())
+    else:
+        model = model.to(device=_device(), dtype=_torch_dtype(cfg))
+    # PSPR can require an fp32 selector even when its DFlash backbone is bf16.
+    # Apply this after the parent cast above, which would otherwise undo the
+    # architecture's decision-precision contract.
+    if hasattr(draft_model, "enforce_selector_compute_dtype"):
+        draft_model.enforce_selector_compute_dtype()
     return AlgorithmModelParts(
         model=model,
         capture_layers=list(draft_model.target_layer_ids),
@@ -400,12 +434,25 @@ def build_dflash_model(
             selector_loss_alpha=cfg.training.dflash2_selector_loss_alpha,
             selector_err_loss_alpha=cfg.training.dflash2_selector_err_loss_alpha,
             selector_own_denominator=cfg.training.dflash2_selector_own_denominator,
+            selector_weight_mode=cfg.training.dflash2_selector_weight_mode,
+            selector_frontier_boost=cfg.training.dflash2_selector_frontier_boost,
+            selector_survival_floor=cfg.training.dflash2_selector_survival_floor,
+            selector_objective=cfg.training.dflash2_selector_objective,
+            selector_err_weight_mode=cfg.training.dflash2_selector_err_weight_mode,
             selector_warmup_ratio=cfg.training.dflash2_selector_warmup_ratio,
             selector_ramp_ratio=cfg.training.dflash2_selector_ramp_ratio,
             selector_stop_gradient=cfg.training.dflash2_selector_stop_gradient,
             selector_target_greedy_labels=(
                 cfg.training.dflash2_selector_target_greedy_labels
             ),
+            selector_alt_loss_alpha=cfg.training.dflash2_selector_alt_loss_alpha,
+            selector_safe_loss_alpha=cfg.training.dflash2_selector_safe_loss_alpha,
+            selector_repair_loss_alpha=cfg.training.dflash2_selector_repair_loss_alpha,
+            selector_safe_margin=cfg.training.dflash2_selector_safe_margin,
+            selector_repair_margin=cfg.training.dflash2_selector_repair_margin,
+            selector_preserve_fp32=cfg.training.dflash2_selector_preserve_fp32,
+            selector_distill_alpha=cfg.training.dflash2_selector_distill_alpha,
+            selector_distill_temperature=cfg.training.dflash2_selector_distill_temperature,
             lk_loss_type=cfg.training.lk_loss_type,
             kl_scale=cfg.training.kl_scale,
             kl_decay=cfg.training.kl_decay,

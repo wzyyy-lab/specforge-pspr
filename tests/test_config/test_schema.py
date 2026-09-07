@@ -350,6 +350,26 @@ class ConfigSchemaTest(unittest.TestCase):
         default_config = Config.model_validate(_online_payload("dflash"))
         self.assertFalse(default_config.training.dflash2_selector_stop_gradient)
 
+        profitable = _online_payload("dflash")
+        profitable["training"]["dflash2_selector_objective"] = "profitable_repair"
+        self.assertEqual(
+            Config.model_validate(profitable).training.dflash2_selector_objective,
+            "profitable_repair",
+        )
+
+        accept_repair = _online_payload("dflash")
+        accept_repair["training"]["dflash2_selector_objective"] = "accept_repair"
+        self.assertEqual(
+            Config.model_validate(accept_repair).training.dflash2_selector_objective,
+            "accept_repair",
+        )
+        action = _online_payload("dflash")
+        action["training"]["dflash2_selector_objective"] = "profitable_action"
+        self.assertEqual(
+            Config.model_validate(action).training.dflash2_selector_objective,
+            "profitable_action",
+        )
+
         for field, invalid in (
             ("dflash2_selector_loss_alpha", -0.1),
             ("dflash2_selector_warmup_ratio", -0.1),

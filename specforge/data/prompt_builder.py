@@ -259,6 +259,25 @@ def _normalize_integer_sequence(
     source: str,
     binary: bool,
 ) -> list[int]:
+    # JSONL yields flat lists of exact Python ints. Avoid two expensive ABC
+    # isinstance checks per token on hundreds of millions of prepared tokens.
+    # Keep a copy and retain the original path for bools, numpy scalars, nested
+    # containers and invalid input, including its exact validation errors.
+    if type(value) is list and all(type(item) is int for item in value):
+        if not binary or all(item in (0, 1) for item in value):
+            return value.copy()
+    return _normalize_integer_sequence_general(
+        value, field=field, source=source, binary=binary
+    )
+
+
+def _normalize_integer_sequence_general(
+    value: Any,
+    *,
+    field: str,
+    source: str,
+    binary: bool,
+) -> list[int]:
     if hasattr(value, "tolist"):
         value = value.tolist()
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):

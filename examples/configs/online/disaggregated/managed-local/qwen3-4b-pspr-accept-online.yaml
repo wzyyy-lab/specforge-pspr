@@ -1,0 +1,117 @@
+# PSPR acceptance-aligned joint training.
+#
+# This file supersedes the historical exploratory PSPR config for a full pass.
+# Short pilots may override training.max_steps, but their cosine schedule then
+# differs from this full-run schedule and their checkpoint must not be called a
+# converged result.
+
+model:
+  target_model_path: /kl_infra_infer_intern/wangzhuoyu/TAPS-SP/models/Qwen3-4B
+  draft_model_config: configs/qwen3-4b-pspr-trans128-fp32.json
+  draft_checkpoint_path: ./outputs/pspr_s1_step2000_init
+  target_backend: sglang
+  embedding_key: model.embed_tokens.weight
+  torch_dtype: bfloat16
+  mask_token_id: 151669
+  sglang_context_length: 3200
+
+data:
+  train_data_path: ./cache/dataset/perfectblend_qwen3-4b_regen.jsonl
+  max_length: 3072
+  # Evaluation renders a bare user turn, so do not inject a system message.
+  chat_template: qwen-nosys
+  cache_dir: ./cache
+  build_dataset_num_proc: 32
+
+training:
+  strategy: dflash
+  num_epochs: 1
+  batch_size: 2
+  accumulation_steps: 2
+  fsdp_sharding: "NO_SHARD"
+
+  # The warm selector can move quickly; the pretrained DFlash backbone must not
+  # be exposed to the 6e-4 head rate (the prior full-rate run forgot code/math).
+  learning_rate: 6.0e-4
+  lr_scale_rules:
+    "candidate_selector.": 1.0
+    "": 0.05
+  warmup_ratio: 0.04
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  weight_decay_rules:
+    "candidate_selector.gamma": 0.0
+    "candidate_selector.predecessor_codebook": 0.0
+    "candidate_selector.successor_codebook": 0.0
+    "candidate_selector.": 2.0e-3
+
+  attention_backend: flex_attention
+  num_anchors: 512
+  objective_chunk_blocks: 128
+
+  # Backbone objective. D-PACE(alpha=.5) and the selector objective below use
+  # smoothed prefix-survival curricula; neither is reported as an exact
+  # expected-accept gradient.
+  loss_type: dpace
+  dpace_alpha: 0.5
+  lk_loss_type: lambda
+  kl_scale: 1.0
+  kl_decay: 1.0
+
+  # P(keep)=sigmoid(-err); P(repair j)=sigmoid(err)*softmax(alt)_j.
+  # A D-PACE-style smoothed-survival surrogate prioritises actions by their
+  # accepted-prefix value without letting one low-probability/top-k-miss action
+  # starve every later repair of gradient. A miss itself has no valid selector
+  # action and stays unsupervised; full-vocabulary backbone CE must improve its
+  # candidate recall.
+  dflash2_selector_objective: keep_repair
+  dflash2_selector_weight_mode: smoothed_accept
+  dflash2_selector_survival_floor: 0.5
+  dflash2_selector_loss_alpha: 1.0
+  dflash2_selector_err_loss_alpha: 0.0
+  # Must remain false: a local selector mean changes with rank/microbatch
+  # partitioning. The additive selector numerator shares the trainer's globally
+  # reduced base denominator; alpha controls relative scale.
+  dflash2_selector_own_denominator: false
+  dflash2_selector_warmup_ratio: 0.0
+  dflash2_selector_ramp_ratio: 0.0
+  dflash2_selector_stop_gradient: false
+  dflash2_selector_target_greedy_labels: false
+
+  save_interval: 200
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+
+tracking:
+  report_to: tensorboard
+
+runtime:
+  producer_lease: 8
+  producer_concurrency: 2
+  in_flight_high_watermark: 256
+  in_flight_low_watermark: 192
+
+run_id: qwen3-4b-pspr-accept-online
+output_dir: ./outputs/qwen3-4b-pspr-accept-online
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 7
+  disaggregated:
+    control_dir: outputs/qwen3-4b-pspr-accept-online/control
+    consumer_state_dir: outputs/qwen3-4b-pspr-accept-online/consumer-state
+    backend: mooncake
+    managed_local:
+      trainer_cuda_visible_devices: ["1", "2", "3", "4", "5", "6", "7"]
+      mooncake:
+        protocol: tcp
+        global_segment_size_bytes: 34359738368
+        local_buffer_size_bytes: 2147483648
+      capture_servers:
+        - port: 30000
+          cuda_visible_devices: ["0"]
+          tp_size: 1
+          mem_fraction_static: 0.5

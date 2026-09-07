@@ -35,6 +35,13 @@ def bind_run(cfg: Config, algorithm: AlgorithmRegistration) -> ResolvedRun:
 
     from specforge.application.planning import validate_resolved_run
 
+    # Opt-in training supervision changes the feature contract, not the model.
+    # Clone the registration for this run; never mutate the shared catalog or
+    # make historical DFlash/PSPR jobs capture extra privileged tensors.
+    if cfg.training.dflash2_selector_objective == "candidate_distill":
+        from specforge.algorithms.dflash.providers import with_candidate_teacher
+
+        algorithm = with_candidate_teacher(algorithm, cfg)
     validate_resolved_run(cfg, algorithm)
     return ResolvedRun(config=cfg, algorithm=algorithm)
 

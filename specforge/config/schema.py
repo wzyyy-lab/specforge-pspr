@@ -571,8 +571,12 @@ class TrainingConfig(StrictConfigModel):
     dpace_alpha: float = 0.5
     #: Per-prefix learning-rate multipliers on draft parameter names, e.g.
     #: ``{"model.": 0.05}`` to fine-tune a pretrained backbone far more slowly than a freshly
-    #: initialised head during joint training. Unmatched parameters keep the configured rate;
-    #: the longest matching prefix wins.
+    #: initialised head during joint training. Unmatched parameters keep the configured rate.
+    #: Effective semantics is LONGEST matching prefix wins, and it comes from two layers that must be
+    #: read together: ``assembly.py`` sorts these rules by descending prefix length before handing
+    #: them over, and ``optimizer.py``'s own matcher then returns on its first hit. So the order
+    #: written here does not matter -- but any code path that builds ``BF16Optimizer`` directly must
+    #: replicate that sort, or it silently gets first-match-in-insertion-order instead.
     lr_scale_rules: Dict[str, float] = Field(default_factory=dict)
     #: AdamW weight decay. Reaches the optimizer for every strategy; the default keeps the historical
     #: behaviour of no decay.
@@ -581,17 +585,117 @@ class TrainingConfig(StrictConfigModel):
     #: ``{"candidate_selector.gamma": 0.0}``. The dh2048 recipe exempts the selector's scalar gain
     #: from decay: it starts at 0 and must travel to ~1 for the head to have any effect, so shared
     #: decay actively pulls it back toward the no-op point. Unmatched parameters keep
-    #: ``weight_decay``; the longest matching prefix wins.
+    #: ``weight_decay``; as with ``lr_scale_rules`` the longest matching prefix wins, via the same
+    #: descending-length sort in ``assembly.py``.
     weight_decay_rules: Dict[str, float] = Field(default_factory=dict)
     #: Weight of the top-k path-selector objective for DFlash2 drafts.
     dflash2_selector_loss_alpha: float = Field(default=1.0, ge=0.0)
     #: Weight of the selector's optional frontier "base top-1 is wrong" detector objective. Applies
     #: to any selector that declares ``wants_err_objective``; 0 leaves the detector untrained.
+    #: With ``keep_repair`` or ``profitable_repair`` this must remain zero because the factorised
+    #: main likelihood already contains its binary gate BCE.  This coefficient is for the
+    #: historical ``multiclass`` objective only.
     dflash2_selector_err_loss_alpha: float = Field(default=0.0, ge=0.0)
-    #: Average the selector's CE over covered slots instead of over the base objective's denominator.
-    #: The latter scales the term by top-k coverage, which makes the selector's effective weight
-    #: depend on backbone recall; the former matches the reference selector training setup.
+    #: Reserved legacy switch. ``true`` is rejected because a selector-local
+    #: mean is not partition-invariant under DDP or gradient accumulation once
+    #: its gradient is mixed with the base objective. Keep this false; selector
+    #: and optional error numerators share TrainerCore's globally reduced base
+    #: denominator, with their relative scales controlled by the alpha knobs.
     dflash2_selector_own_denominator: bool = False
+    #: How the selector's per-slot CE is weighted. ``base_dpace`` (default, previous behaviour)
+    #: inherits the base objective's weights, which under any D-PACE ``loss_type`` means the
+    #: selector is silently reweighted by prefix survival. ``uniform`` weights every covered slot
+    #: equally, matching what ``scripts/train_pspr_accept_selector.py`` trains stage-1 under, so a
+    #: warm-started selector does not change objective the moment it is loaded.
+    #: ``teacher_forced_frontier`` uses the current selector's leading-correct
+    #: run plus its first error while states come from the teacher-forced
+    #: predecessor sequence.  It matches deterministic serving occupancy up to
+    #: that error only when the teacher-forced sequence is itself the target's
+    #: correct continuation (for example target-regenerated greedy data).
+    #: ``expected_accept`` applies exact detached marginal-value weights for the
+    #: gradient of expected accepted-prefix length on the supplied teacher-forced
+    #: states.  It equals the decode-time objective only when predecessors and
+    #: labels form one self-consistent target continuation (as target-regenerated
+    #: data normally does); replacing labels alone does not make corpus states
+    #: target-prefix states. It is currently valid only with ``keep_repair`` and
+    #: zero repair margin; model construction rejects other combinations.
+    #: ``smoothed_accept`` uses the same acceptance-value ordering but replaces
+    #: each survival probability q by ``floor + (1-floor)*q`` before forming
+    #: detached weights. This is intentionally a D-PACE-style optimization
+    #: surrogate, not an exact expected-accept gradient: its non-zero floor
+    #: prevents an early bad action/top-k miss from starving every later repair
+    #: of supervision. Top-k-miss slots themselves remain unsupervised because
+    #: no selector action can emit the missing target.
+    dflash2_selector_weight_mode: Literal[
+        "base_dpace",
+        "uniform",
+        "uniform_frontier_boost",
+        "reachable_frontier_boost",
+        "teacher_forced_frontier",
+        "expected_accept",
+        "smoothed_accept",
+    ] = "base_dpace"
+    #: Extra CE weight placed on the current first-error slot by ``uniform_frontier_boost``.
+    #: Also used by teacher_forced_frontier and reachable_frontier_boost.
+    #: 0 makes uniform_frontier_boost bit-identical to uniform.
+    dflash2_selector_frontier_boost: float = Field(default=0.0, ge=0.0)
+    #: Opt-in SlotDeep training-only losses. No selector parameters or serving rules change.
+    #: Alternative CE uses existing selector slot weights on covered non-base targets.
+    #: Boundary hinges use the teacher-forced policy prefix including its first failure.
+    dflash2_selector_alt_loss_alpha: float = Field(default=0.0, ge=0.0, allow_inf_nan=False)
+    dflash2_selector_safe_loss_alpha: float = Field(default=0.0, ge=0.0, allow_inf_nan=False)
+    dflash2_selector_repair_loss_alpha: float = Field(default=0.0, ge=0.0, allow_inf_nan=False)
+    dflash2_selector_safe_margin: float = Field(default=0.1, ge=0.0, allow_inf_nan=False)
+    dflash2_selector_repair_margin: float = Field(default=0.1, ge=0.0, allow_inf_nan=False)
+    #: Preserve loaded SlotDeep FP32 values through wrapper assembly. False retains legacy casts.
+    dflash2_selector_preserve_fp32: bool = False
+    #: Training-only candidate distribution distillation. Active only with the
+    #: candidate_distill objective; the served selector and parameter count stay unchanged.
+    dflash2_selector_distill_alpha: float = Field(default=0.5, ge=0.0, allow_inf_nan=False)
+    dflash2_selector_distill_temperature: float = Field(default=1.0, gt=0.0, allow_inf_nan=False)
+    #: Minimum survival factor for ``smoothed_accept``; for the opt-in SlotDeep
+    #: ``reachable_frontier_boost``, relative off-prefix weight before per-block
+    #: covered-mass renormalization. A value of 1 reproduces uniform_frontier_boost.
+    #: 0 is excluded
+    #: so this mode cannot silently become the gradient-starved exact objective;
+    #: use ``expected_accept`` explicitly for that ablation.
+    dflash2_selector_survival_floor: float = Field(default=0.5, gt=0.0, le=1.0)
+    #: Selector likelihood. ``multiclass`` is the historical K-way CE over unary-plus-correction
+    #: scores. ``keep_repair`` factorises a top-1-wrong detector and conditional alternatives, but
+    #: treats a top-k miss as requiring an impossible repair. ``profitable_repair`` uses the same
+    #: normalized serving distribution while training REPAIR iff the target is one of candidates
+    #: 1..K-1; correct top-1 and top-k miss both train the deployable ABSTAIN action.
+    #: ``accept_repair`` has the same labels on covered slots but masks top-k misses: at such a slot
+    #: KEEP and every replacement all accept zero tokens, so forcing an arbitrary KEEP label adds a
+    #: conservative gradient that is not part of the acceptance-length objective.
+    #: ``profitable_action`` instead applies one K-way CE directly to the deployable action:
+    #: class 0 is KEEP for both correct-top1 and top-k-miss slots, while classes 1..K-1 are repairs.
+    #: It therefore gives the state-conditioned scorer both positive repair and abundant KEEP
+    #: negatives instead of starving it on every non-repair slot.
+    #: ``covered_conditional`` is a structured "top-16 or NONE" likelihood:
+    #: ``q = sigmoid(coverage_logit) = P(y in C)`` and ``r = softmax(scores)`` over all K candidates,
+    #: giving ``P(NONE) = 1-q`` and ``P(c_j) = q*r_j``, trained as
+    #: ``BCE(q, covered) + covered * CE(r, target_index)``.  A top-k miss becomes its own outcome
+    #: instead of being dropped (multiclass), relabelled KEEP (profitable_action), or folded into the
+    #: abstain branch (the factorised family, where ``1-p = P(c_0) + P(y not in C)`` overestimates
+    #: KEEP by a measured 0.10-0.16).  KEEP stays inside the K-way conditional softmax, which matters:
+    #: decoding trained cloze weights with a rule that discards ``scores[0]`` cost 0.69 accept and
+    #: doubled destroys.  ``q`` multiplies all K candidates equally and cancels in the serving argmax,
+    #: so it is never evaluated at decode and this objective costs nothing over multiclass to serve.
+    dflash2_selector_objective: Literal[
+        "multiclass",
+        "candidate_distill",
+        "keep_repair",
+        "profitable_repair",
+        "accept_repair",
+        "profitable_action",
+        "covered_conditional",
+    ] = "multiclass"
+    #: Slots used by the optional binary top-1-error auxiliary loss. ``base_frontier`` preserves
+    #: historical behaviour. ``all_valid`` also trains states reached after a successful repair;
+    #: those prefixes are valid under teacher forcing and are required by a selector that continues
+    #: beyond the uncorrected DFlash frontier.
+    dflash2_selector_err_weight_mode: Literal["base_frontier", "all_valid"] = "base_frontier"
     #: Fraction of optimizer steps that train only the DFlash2 base objective.
     dflash2_selector_warmup_ratio: float = Field(default=0.0, ge=0.0, le=1.0)
     #: Fraction of optimizer steps used to ramp the selector weight to its target.
@@ -638,6 +742,14 @@ class TrainingConfig(StrictConfigModel):
 
     @model_validator(mode="after")
     def _validate_training_shape(self):
+        if self.strategy != "dflash" and (
+            self.dflash2_selector_alt_loss_alpha > 0
+            or self.dflash2_selector_safe_loss_alpha > 0
+            or self.dflash2_selector_repair_loss_alpha > 0
+            or self.dflash2_selector_preserve_fp32
+            or self.dflash2_selector_objective == "candidate_distill"
+        ):
+            raise ValueError("SlotDeep training extensions require training.strategy='dflash'")
         if not 0.0 <= self.dpace_alpha <= 1.0:
             raise ValueError("training.dpace_alpha must be in [0, 1]")
         if not 0.0 < self.down_sample_ratio <= 1.0:

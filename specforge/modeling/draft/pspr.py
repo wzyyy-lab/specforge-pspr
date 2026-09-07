@@ -1,5 +1,5 @@
 # coding=utf-8
-"""PSPR: a bidirectional path selector over the draft block's top-K candidate lattice.
+"""PSPR: a bidirectional slot-summary selector over a draft block's top-K candidates.
 
 Positioning against what already exists in this codebase, since both neighbours are close:
 
@@ -12,11 +12,13 @@ Positioning against what already exists in this codebase, since both neighbours 
     low-rank bigram, ``unary + <predecessor . W h, successor>``, with no cross-slot term, and
     ``greedy_path`` is a plain left-to-right walk.
 
-This module keeps the top-K formulation and the causal committed-prefix state, and adds the piece
-neither has: a **bidirectional transformer over the whole block's lattice**. Every slot's summary
-attends to every other slot's candidate set, log-probs and uncertainty statistics before any token
-is committed. That is decode-legal because the lattice comes from one parallel all-MASK pass and is
-fixed for the whole block, unlike committed tokens.
+This module keeps the top-K formulation and the causal committed-prefix state, and adds a
+**bidirectional transformer over H slot summaries**.  Each slot first compresses its K candidates to
+one probability-weighted embedding centroid; the H summary tokens then attend bidirectionally before
+any token is committed.  This is decode-legal because the summaries come from one parallel all-MASK
+pass and are fixed for the whole block.  It is important not to call this an H-by-K lattice
+Transformer: candidate cells do not attend to one another and every candidate at a slot receives the
+same cross-slot context.
 
 Why the lattice is not redundant with the backbone's own bidirectionality: the backbone does mix
 slots (its within-block attention is unrestricted), but it mixes *hidden states*. The lattice is the
@@ -48,12 +50,22 @@ from .registry import register_draft
 
 
 class LatticePathSelector(nn.Module):
-    """Scores a slot's top-K candidates using the whole block's lattice plus the committed prefix."""
+    """Scores top-K candidates from H slot summaries plus a causal committed-prefix state."""
 
     # The host reads this to decide whether to add the frontier detector's BCE term. It does NOT
     # read a `wants_full_logits` flag -- full logits reach this selector because it implements
     # `extract_lattice`, which the host prefers over a bare `topk` when present.
     wants_err_objective = True
+
+    # ``OnlineDFlashModel`` represents a training block as
+    # ``[anchor, proposal_1, ..., proposal_H]``.  The external decoder and the
+    # stage-1 trace format represent the selector lattice as proposal slots only.
+    # PSPR has positional embeddings and bidirectional cross-slot attention, so
+    # merely masking the anchor's loss is insufficient: leaving it in the
+    # selector shifts every proposal's positional embedding by one and lets an
+    # inference-absent pseudo-slot alter all proposal representations.  Ask the
+    # host to remove that slot before *any* lattice extraction or selector call.
+    selector_excludes_anchor = True
 
     def __init__(
         self,
@@ -255,13 +267,17 @@ class LatticePathSelector(nn.Module):
         weight = getattr(embed_tokens, "weight", embed_tokens)
         self.target_embedding = weight.detach()
 
-    def _embedding(self, dtype: torch.dtype) -> torch.Tensor:
+    def _embedding(self) -> torch.Tensor:
         weight = self.target_embedding
         if weight.numel() == 0:
             raise RuntimeError(
                 "LatticePathSelector needs bind_target_embedding() before the first forward"
             )
-        return weight.to(dtype=dtype)
+        # Embedding lookup is part of the selector decision.  Always use the
+        # selector's configured compute precision instead of accepting a caller
+        # dtype (which previously let a BF16 backbone silently down-cast this
+        # path before a nominal FP32 selector forward).
+        return weight.to(dtype=self.dh_in.weight.dtype)
 
     def extract_lattice(
         self, logits: torch.Tensor
@@ -284,9 +300,18 @@ class LatticePathSelector(nn.Module):
         position = torch.where(
             found, matches.long().argmax(dim=-1, keepdim=True), torch.zeros_like(argmax_ids)
         )
-        if bool((position != 0).any()):
-            gathered_ids = candidate_ids.gather(-1, position)
-            gathered_logits = top_logits.gather(-1, position)
+        # Usually argmax is present in top-k.  With more than K values tied for
+        # the maximum, however, ``topk`` is allowed to omit the lowest-index
+        # token chosen by ``argmax``.  In that case inject it explicitly and
+        # drop the old column 0; its logit is necessarily tied, so the set's
+        # numerical statistics remain unchanged.
+        if bool(((position != 0) | (~found)).any()):
+            gathered_ids = torch.where(found, candidate_ids.gather(-1, position), argmax_ids)
+            gathered_logits = torch.where(
+                found,
+                top_logits.gather(-1, position),
+                float_logits.gather(-1, argmax_ids),
+            )
             first_ids = candidate_ids[..., :1]
             first_logits = top_logits[..., :1]
             candidate_ids = candidate_ids.scatter(-1, position, first_ids)
@@ -456,6 +481,72 @@ class LatticePathSelector(nn.Module):
         )
         return self.err_head(features).squeeze(-1).float()
 
+    @staticmethod
+    def keep_repair_log_probs(
+        candidate_scores: torch.Tensor, err_logits: torch.Tensor
+    ) -> torch.Tensor:
+        """Normalized log-probabilities for the factorised keep/repair action.
+
+        Candidate 0 is the draft's exact greedy token.  The detector estimates whether that token is
+        wrong; conditional on repair, the scorer ranks only candidates 1..K-1.  Unlike a heuristic
+        threshold over an unrelated K-way softmax, this distribution is trained and decoded with the
+        same semantics.
+        """
+
+        if candidate_scores.shape[-1] < 2:
+            raise ValueError("keep/repair selection requires at least two candidates")
+        return torch.cat(
+            [
+                F.logsigmoid(-err_logits.float()).unsqueeze(-1),
+                F.logsigmoid(err_logits.float()).unsqueeze(-1)
+                + F.log_softmax(candidate_scores.float()[..., 1:], dim=-1),
+            ],
+            dim=-1,
+        )
+
+    @classmethod
+    def select_keep_repair(
+        cls,
+        candidate_scores: torch.Tensor,
+        err_logits: torch.Tensor,
+        *,
+        repair_margin: float = 0.0,
+    ) -> torch.Tensor:
+        """Select the joint MAP keep/repair action used by training and serving."""
+
+        action_log_probs = cls.keep_repair_log_probs(candidate_scores, err_logits)
+        if repair_margin:
+            action_log_probs = action_log_probs.clone()
+            action_log_probs[..., 1:] -= float(repair_margin)
+        return action_log_probs.argmax(dim=-1, keepdim=True)
+
+    @staticmethod
+    def select_margin_gate(
+        candidate_scores: torch.Tensor,
+        *,
+        err_logits: Optional[torch.Tensor] = None,
+        rho: float = 1.0,
+        tau: float = 0.0,
+        theta: float = 0.0,
+        force_keep_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Apply the historical PSPR gate, shared by training occupancy and serving."""
+
+        probabilities = torch.softmax(candidate_scores.float(), dim=-1)
+        best_alt_probability, best_alt_offset = probabilities[..., 1:].max(dim=-1)
+        use_alt = best_alt_probability > (
+            float(tau) + float(rho) * probabilities[..., 0]
+        )
+        if force_keep_mask is not None:
+            use_alt &= ~force_keep_mask.bool()
+        if theta > 0:
+            if err_logits is None:
+                raise ValueError("theta > 0 requires err_logits")
+            use_alt &= torch.sigmoid(err_logits.float()) > float(theta)
+        return torch.where(
+            use_alt, best_alt_offset + 1, torch.zeros_like(best_alt_offset)
+        ).unsqueeze(-1)
+
     def score_candidates(
         self,
         *,
@@ -476,7 +567,13 @@ class LatticePathSelector(nn.Module):
         computed from the same encoder and GRU pass so the auxiliary objective costs no extra
         forward work.
         """
-        embedding = self._embedding(hidden_states.dtype)
+        # Candidate/prefix embeddings are part of the selector computation, not
+        # the BF16 draft backbone.  Key their precision to the selector's own
+        # parameters so selector_compute_dtype=float32 is an end-to-end
+        # contract.  Casting through hidden_states.dtype first would discard
+        # information before encode() promoted the centroid back to FP32 and
+        # made native serving disagree with the external FP32 evaluator.
+        embedding = self._embedding()
         candidate_embeddings = F.embedding(candidate_ids, embedding)
         prefix_embeddings = F.embedding(predecessor_ids, embedding)
         unary_logits = unary_logits.float()
@@ -517,6 +614,17 @@ class PSPRDraftModel(DFlashDraftModel):
     """DFlash backbone with a bidirectional lattice path selector."""
 
     warm_start_optional_prefixes = ("candidate_selector.",)
+    # A transition-enabled PSPR is commonly initialized from a complete
+    # stage-1 PSPR checkpoint that predates these three tensors.  They form one
+    # bilinear term and must therefore be absent together; the generic warm
+    # loader rejects a partial group instead of silently mixing checkpoints.
+    warm_start_optional_key_groups = (
+        (
+            "candidate_selector.predecessor_codebook",
+            "candidate_selector.successor_codebook",
+            "candidate_selector.trans_proj.weight",
+        ),
+    )
 
     def _init_draft_head(self, config, dflash_config: dict) -> None:
         self.candidate_selector = LatticePathSelector(
@@ -534,6 +642,34 @@ class PSPRDraftModel(DFlashDraftModel):
             trans_rank=int(dflash_config.get("selector_trans_rank", 0)),
         )
         self.freeze_backbone = bool(dflash_config.get("freeze_backbone", False))
+        self.selector_compute_dtype = str(
+            dflash_config.get("selector_compute_dtype", "model")
+        )
+        if self.selector_compute_dtype not in {"model", "float32"}:
+            raise ValueError(
+                "selector_compute_dtype must be 'model' or 'float32', got "
+                f"{self.selector_compute_dtype!r}"
+            )
+        # Serving-time conservative override policy.  rho=1/tau=theta=0 is
+        # ordinary selector argmax; trained checkpoints may opt into the safer
+        # rho>1 policy used by the external evaluation decoder.
+        self.selector_gate_rho = float(dflash_config.get("selector_gate_rho", 1.0))
+        self.selector_gate_tau = float(dflash_config.get("selector_gate_tau", 0.0))
+        self.selector_gate_theta = float(dflash_config.get("selector_gate_theta", 0.0))
+        self.selector_gate_skip_first = bool(
+            dflash_config.get("selector_gate_skip_first", False)
+        )
+        self.selector_decision_mode = str(
+            dflash_config.get("selector_decision_mode", "margin_gate")
+        )
+        if self.selector_decision_mode not in {"margin_gate", "keep_repair"}:
+            raise ValueError(
+                "selector_decision_mode must be 'margin_gate' or 'keep_repair', got "
+                f"{self.selector_decision_mode!r}"
+            )
+        self.selector_keep_repair_margin = float(
+            dflash_config.get("selector_keep_repair_margin", 0.0)
+        )
 
     def _init_weights(self, module) -> None:
         """Keep the delta output at zero through HF's own init path.
@@ -562,6 +698,101 @@ class PSPRDraftModel(DFlashDraftModel):
 
     def bind_target_decoder(self, embed_tokens: nn.Module) -> None:
         self.candidate_selector.bind_target_embedding(embed_tokens)
+        self.enforce_selector_compute_dtype()
+
+    def enforce_selector_compute_dtype(self) -> None:
+        """Keep the decision head in its configured precision.
+
+        The reference PSPR head and external decoder compute in fp32.  A parent
+        ``model.to(bfloat16)`` otherwise silently casts all selector parameters
+        and can flip close keep/repair decisions.  The training provider calls
+        this once after its final parent cast; native serving calls it when the
+        target embedding is first bound.
+        """
+        if self.selector_compute_dtype == "float32":
+            self.candidate_selector.to(dtype=torch.float32)
+
+    def _sample_draft_tokens(
+        self,
+        target: nn.Module,
+        draft_hidden: torch.Tensor,
+        block_output_ids: torch.LongTensor,
+    ) -> torch.LongTensor:
+        """Select a PSPR path in the model's native ``spec_generate`` path.
+
+        Previously PSPR inherited DFlash's implementation, so loading a PSPR
+        checkpoint and calling ``spec_generate`` silently ignored all selector
+        parameters.  This is the same fixed-lattice, left-to-right GRU walk as
+        the external decoder: one LM-head/lattice extraction for the block and
+        no target information beyond the already committed anchor.
+        """
+
+        hidden = draft_hidden[:, -self.block_size + 1 :, :]
+        selector = self.candidate_selector
+        if selector.target_embedding.numel() == 0:
+            self.bind_target_decoder(target.model.embed_tokens)
+        unary_logits, candidate_ids, lattice_scalars = selector.extract_lattice(
+            target.lm_head(hidden)
+        )
+        # Match score_candidates() and the external decoder exactly: the
+        # selector owns the decision precision, while ``hidden`` belongs to the
+        # BF16 backbone.
+        embedding = selector._embedding()
+        candidate_embeddings = F.embedding(candidate_ids, embedding)
+        context = selector.encode(
+            hidden, candidate_embeddings, unary_logits, lattice_scalars
+        )
+
+        predecessor_ids = block_output_ids[:, 0]
+        gru_hidden = None
+        path = []
+        for position in range(candidate_ids.shape[1]):
+            predecessor_embeddings = F.embedding(predecessor_ids, embedding)
+            state, gru_hidden = selector.gru(
+                predecessor_embeddings.unsqueeze(1).to(selector.gru.weight_ih_l0.dtype),
+                gru_hidden,
+            )
+            scores = selector.score(
+                context[:, position],
+                state[:, 0],
+                candidate_embeddings[:, position],
+                unary_logits[:, position],
+                hidden_states=hidden[:, position],
+                predecessor_ids=predecessor_ids,
+                candidate_ids=candidate_ids[:, position],
+            )
+            err_logits = None
+            if self.selector_decision_mode == "keep_repair" or self.selector_gate_theta > 0:
+                err_logits = selector.err_logits(
+                    context[:, position : position + 1],
+                    state,
+                    unary_logits[:, position : position + 1],
+                    lattice_scalars[:, position : position + 1],
+                )[:, 0]
+            if self.selector_decision_mode == "keep_repair":
+                selected_index = selector.select_keep_repair(
+                    scores,
+                    err_logits,
+                    repair_margin=self.selector_keep_repair_margin,
+                )
+            else:
+                force_keep = torch.full(
+                    scores.shape[:-1],
+                    self.selector_gate_skip_first and position == 0,
+                    dtype=torch.bool,
+                    device=scores.device,
+                )
+                selected_index = selector.select_margin_gate(
+                    scores,
+                    err_logits=err_logits,
+                    rho=self.selector_gate_rho,
+                    tau=self.selector_gate_tau,
+                    theta=self.selector_gate_theta,
+                    force_keep_mask=force_keep,
+                )
+            predecessor_ids = candidate_ids[:, position].gather(1, selected_index)[:, 0]
+            path.append(predecessor_ids)
+        return torch.stack(path, dim=1)
 
     def apply_backbone_freeze(self) -> int:
         """Freeze everything except the selector; returns the number of frozen parameters."""

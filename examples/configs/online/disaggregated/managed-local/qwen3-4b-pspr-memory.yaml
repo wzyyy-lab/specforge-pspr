@@ -1,0 +1,86 @@
+# Independent 1000-step Stage-1 pilot. Old head and official backbone are frozen.
+# New residual-only learning; no optimizer/counter resume from mature cloze.
+# Keep the established covered CE and gate fixed to isolate the new information route.
+model:
+  target_model_path: /kl_infra_infer_intern/wangzhuoyu/TAPS-SP/models/Qwen3-4B
+  draft_model_config: configs/qwen3-4b-pspr-memory.json
+  draft_checkpoint_path: outputs/qwen3-4b-pspr-cloze/qwen3-4b-pspr-cloze-step7115/training_state.pt
+  target_backend: sglang
+  embedding_key: model.embed_tokens.weight
+  torch_dtype: bfloat16
+  mask_token_id: 151669
+  sglang_context_length: 3200
+data:
+  train_data_path: ./cache/dataset/perfectblend_qwen3-4b_regen.jsonl
+  max_length: 3072
+  chat_template: qwen-nosys
+  cache_dir: ./cache
+  build_dataset_num_proc: 16
+training:
+  strategy: dflash
+  num_epochs: 1
+  max_steps: 1000
+  batch_size: 2
+  accumulation_steps: 2
+  fsdp_sharding: NO_SHARD
+  learning_rate: 1.0e-4
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  weight_decay_rules:
+    'memory_refiner.memory_in.weight': 2.0e-3
+    'memory_refiner.attn.in_proj_weight': 2.0e-3
+    'memory_refiner.attn.out_proj.weight': 2.0e-3
+    'memory_refiner.ff.0.weight': 2.0e-3
+    'memory_refiner.ff.2.weight': 2.0e-3
+    'memory_refiner.fuse.weight': 2.0e-3
+    'memory_refiner.out.weight': 2.0e-3
+  attention_backend: flex_attention
+  num_anchors: 512
+  objective_chunk_blocks: 64
+  loss_type: dpace
+  dpace_alpha: 0.5
+  lk_loss_type: lambda
+  kl_scale: 1.0
+  kl_decay: 1.0
+  dflash2_selector_objective: multiclass
+  dflash2_selector_weight_mode: uniform_frontier_boost
+  dflash2_selector_frontier_boost: 3.0
+  dflash2_selector_loss_alpha: 1.0
+  dflash2_selector_err_loss_alpha: 0.0
+  dflash2_selector_own_denominator: false
+  dflash2_selector_stop_gradient: false
+  dflash2_selector_target_greedy_labels: false
+  save_interval: 250
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+tracking:
+  report_to: tensorboard
+runtime:
+  producer_lease: 8
+  producer_concurrency: 2
+  in_flight_high_watermark: 128
+  in_flight_low_watermark: 96
+run_id: pspr-memory-s1-20260905
+output_dir: outputs/pspr-memory-s1-20260905
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 3
+  disaggregated:
+    control_dir: outputs/pspr-memory-s1-20260905/control
+    consumer_state_dir: outputs/pspr-memory-s1-20260905/consumer-state
+    backend: mooncake
+    managed_local:
+      trainer_cuda_visible_devices: ['1', '2', '3']
+      mooncake:
+        protocol: tcp
+        global_segment_size_bytes: 17179869184
+        local_buffer_size_bytes: 2147483648
+      capture_servers:
+        - port: 30200
+          cuda_visible_devices: ['0']
+          tp_size: 1
+          mem_fraction_static: 0.45

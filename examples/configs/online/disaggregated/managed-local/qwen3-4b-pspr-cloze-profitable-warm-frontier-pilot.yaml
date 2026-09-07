@@ -1,0 +1,113 @@
+# Warm-start the mature cloze representation and train the asymmetric serving decision directly:
+#   ABSTAIN when top-1 is correct or no top-16 repair exists;
+#   otherwise choose the true token among candidates 1..15.
+# Only the current policy's reachable prefix plus its first failure pays local CE.  A covered first
+# failure receives 1+3 weight; later teacher-forced slots are not part of this block's occupancy.
+
+model:
+  target_model_path: /home/wangzhuoyu/kl_infra_infer_intern/wangzhuoyu/TAPS-SP/models/Qwen3-4B
+  draft_model_config: configs/qwen3-4b-pspr-cloze-profitable.json
+  draft_checkpoint_path: /home/wangzhuoyu/kl_infra_infer_intern/wangzhuoyu/SpecForge/outputs/qwen3-4b-pspr-cloze/qwen3-4b-pspr-cloze-step7115/training_state.pt
+  target_backend: sglang
+  embedding_key: model.embed_tokens.weight
+  torch_dtype: bfloat16
+  mask_token_id: 151669
+  sglang_context_length: 3200
+
+data:
+  train_data_path: ./cache/dataset/perfectblend_qwen3-4b_regen.jsonl
+  max_length: 3072
+  chat_template: qwen-nosys
+  cache_dir: ./cache
+  build_dataset_num_proc: 32
+
+training:
+  strategy: dflash
+  num_epochs: 1
+  total_steps: 1000
+  max_steps: 1000
+  batch_size: 2
+  accumulation_steps: 2
+  fsdp_sharding: "NO_SHARD"
+
+  learning_rate: 1.0e-4
+  warmup_ratio: 0.05
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  weight_decay_rules:
+    "in_proj_weight": 2.0e-3
+    "out_proj.weight": 2.0e-3
+    "linear1.weight": 2.0e-3
+    "linear2.weight": 2.0e-3
+    "weight_ih_l0": 2.0e-3
+    "weight_hh_l0": 2.0e-3
+    "h_in.weight": 2.0e-3
+    "tok_in.weight": 2.0e-3
+    "conf_in.weight": 2.0e-3
+    "delta_w1.weight": 2.0e-3
+    "delta_w2.weight": 2.0e-3
+    "err_seed_in.weight": 2.0e-3
+    "err_head.1.weight": 2.0e-3
+    "err_head.4.weight": 2.0e-3
+
+  attention_backend: flex_attention
+  num_anchors: 512
+  objective_chunk_blocks: 64
+
+  loss_type: dpace
+  dpace_alpha: 0.5
+  lk_loss_type: lambda
+  kl_scale: 1.0
+  kl_decay: 1.0
+
+  dflash2_selector_objective: profitable_repair
+  dflash2_selector_weight_mode: teacher_forced_frontier
+  dflash2_selector_frontier_boost: 3.0
+  # teacher_forced_frontier retains about 0.26 selector weight per base-loss weight on this
+  # dataset.  Scale its additive numerator by 4 so the effective gradient is comparable to the
+  # all-slot warm-start objective; otherwise a 250-step pilot is only about 65 full-weight steps.
+  dflash2_selector_loss_alpha: 4.0
+  dflash2_selector_err_loss_alpha: 0.0
+  dflash2_selector_own_denominator: false
+  dflash2_selector_warmup_ratio: 0.0
+  dflash2_selector_ramp_ratio: 0.0
+  dflash2_selector_stop_gradient: false
+  dflash2_selector_target_greedy_labels: false
+
+  save_interval: 250
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+
+tracking:
+  report_to: tensorboard
+
+runtime:
+  producer_lease: 8
+  producer_concurrency: 2
+  in_flight_high_watermark: 256
+  in_flight_low_watermark: 192
+
+run_id: qwen3-4b-pspr-cloze-profitable-warm-frontier-pilot-r2
+output_dir: ./outputs/qwen3-4b-pspr-cloze-profitable-warm-frontier-pilot-r2
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 7
+  disaggregated:
+    control_dir: outputs/qwen3-4b-pspr-cloze-profitable-warm-frontier-pilot-r2/control
+    consumer_state_dir: outputs/qwen3-4b-pspr-cloze-profitable-warm-frontier-pilot-r2/consumer-state
+    backend: mooncake
+    managed_local:
+      trainer_cuda_visible_devices: ["1", "2", "3", "4", "5", "6", "7"]
+      mooncake:
+        protocol: tcp
+        global_segment_size_bytes: 34359738368
+        local_buffer_size_bytes: 2147483648
+      capture_servers:
+        - port: 30000
+          cuda_visible_devices: ["0"]
+          tp_size: 1
+          mem_fraction_static: 0.5

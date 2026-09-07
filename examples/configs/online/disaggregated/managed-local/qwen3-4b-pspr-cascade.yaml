@@ -1,0 +1,226 @@
+# PSPR-cascade: let the KEEP-vs-REPAIR gate see the ranker's own corrected scores.
+#
+# Warm-started from the 6.0498 champion (PSPR-cloze step7115) with the ranker FROZEN
+# (`selector_train_scope: err_only`), so candidate ordering, z, delta and the GRU stay bit-identical
+# and the only thing that moves is the gate.
+#
+# The claim under test
+# --------------------
+# The champion deploys `--gate-tau 0 --gate-rho 3 --gate-theta 0`: repair iff `max_alt_prob > 3*p0`.
+# On the held-out decision-chain accounting, of 5789 slots whose target is a non-base candidate the
+# target is the ranker's BEST alternative 66.86% of the time, also outranks the base score 44.05% of
+# the time, and 36.71% survive the gate.  The 22.81pp difference is entirely "the base score ranks
+# ahead of the target".  ClozeCorrector.err_logits never receives the corrected scores, so the gate is
+# structurally blind to the quantity its own decision is about; this run feeds them in.
+#
+# Two claims that were made earlier and are RETRACTED, so they cannot creep back into the writeup:
+#   * NOT "the rho rule is capped at 44.05% for any rho".  `p_alt > tau + rho*p0` with tau=0 and
+#     rho<1 admits alternatives that score below candidate 0.  The cap belongs to rho>=1, which is
+#     where the deployed rho=3 sits -- that is the honest, narrower statement.
+#   * NOT "66.86% is the cascade's ceiling".  That rate is conditional on the champion's trajectory;
+#     repairing a first error lengthens the block and exposes a different first error, moving every
+#     later block boundary and GRU state.  No offline number bounds the deployed result.
+#
+# So this run is a MEASUREMENT of whether pricing each slot individually beats charging every slot the
+# same scalar margin -- not a confirmation of a computed bound.
+#
+# Baseline to beat (identical backbone, six domains, n=20 each):
+#   champion PSPR-cloze step7115, latgate rho=3   macro 6.0498   (paired SEM 0.0244)
+#   oracle@16 on the same lattice                 macro 10.4422
+#
+# The control arm is qwen3-4b-pspr-cascade-blind.yaml: identical in every respect except
+# `selector_err_score_enabled: false`, which removes the score-feature head and leaves the anchor,
+# the base gain, the objective, the freeze set, the data order and the seed untouched.  Without it a
+# gain could be attributed to the cascade when it actually came from relabelling the old detector from
+# "base wrong" to "profitable alternative exists".
+
+model:
+  target_model_path: /kl_infra_infer_intern/wangzhuoyu/TAPS-SP/models/Qwen3-4B
+  draft_model_config: configs/qwen3-4b-pspr-cascade.json
+  # WARM START from the 6.0498 champion, not from the bare backbone.  The loader needs
+  # `warm_start_optional_key_groups` to accept it: `warm_start_optional_prefixes` is applied
+  # all-or-nothing per prefix and is SKIPPED whenever the source carries any key under the prefix, and
+  # a champion checkpoint does carry candidate_selector.* -- so without the exact all-or-nothing group
+  # declared in pspr_cascade.py the launch dies at load time.  Exercised end to end against the real
+  # loader in scripts/smoke_pspr_cascade_e2e.py.
+  #
+  # What "starts from the champion" means precisely.  It is NOT that the gate LOGIT equals the
+  # champion's -- the champion deploys theta=0 and decode_lattice only consults the detector under
+  # `if ok and gate_theta > 0`, so the mature detector is not part of the deployed policy at all.  It
+  # is that the gate logit is initialised to the analytic
+  #     e_0 = logsumexp(s_1:) - s_0 - log(3)
+  # which makes the factorized MAP rule `e + log r_* > 0` reduce to `s_max_alt - s_0 > log 3`, i.e.
+  # exactly `p_alt > 3*p0` at tau=0, ties included.  So step 0 reproduces the champion's DECISIONS
+  # slot for slot (gate_pspr_cascade.py: 0/20 mismatches at rho 1, 3 and 10) while `err_base_gain`
+  # starts at 0 and the score read-out starts at 0.  Without that anchor, `keep_repair` at step 0
+  # would instead reproduce the historically WORSE `latrepair m=0` policy.
+  draft_checkpoint_path: ./outputs/qwen3-4b-pspr-cloze/qwen3-4b-pspr-cloze-step7115
+  target_backend: sglang
+  embedding_key: model.embed_tokens.weight
+  torch_dtype: bfloat16
+  mask_token_id: 151669
+  sglang_context_length: 3200
+
+data:
+  train_data_path: ./cache/dataset/perfectblend_qwen3-4b_regen.jsonl
+  max_length: 3072
+  # Evaluation renders a bare user turn, so do not inject a system message.
+  chat_template: qwen-nosys
+  cache_dir: ./cache
+  build_dataset_num_proc: 32
+
+training:
+  strategy: dflash
+  num_epochs: 1
+  batch_size: 2
+  accumulation_steps: 2
+  fsdp_sharding: "NO_SHARD"
+
+  # Only the corrector trains; the backbone carries requires_grad=False from apply_backbone_freeze,
+  # so no scale rule can leak the head's rate into it.  5e-4 is the rate stage-1 proved on this head
+  # (4e-4 * sqrt(2) effective), and the audit's warning against 6e-4 was about exposing the BACKBONE
+  # to the head's rate and forgetting code/math -- with the backbone frozen there is nothing to
+  # forget.  The online global batch is ~28x larger in anchors, so if anything this is conservative.
+  learning_rate: 5.0e-4
+  # 0.03 (213 steps) is what v2 used with a 3-layer encoder.  Doubled here because the
+  # 6-layer pre-LN stack starts from scratch AND `delta_w2` is zero-initialised, which makes
+  # the upstream gradient exactly zero on step 1 -- the encoder cannot start learning until
+  # W2 has grown, so the ramp needs more room.
+  warmup_ratio: 0.06
+  max_grad_norm: 1.0
+  weight_decay: 0.0
+  weight_decay_rules:
+    # `match()` scans rules sorted by DESCENDING prefix length and returns the first hit, so v2's
+    # catch-all `candidate_selector.` (19 chars) shadows every shorter rule -- which is why v2 ends
+    # up decaying all 74 of its LayerNorm weights, LayerNorm biases and biases at 2e-3.  cloze has
+    # three times as many LayerNorms (per-stream input norms, per-stream fusion norms, 12 encoder
+    # norms), so that bug would bite much harder here.
+    #
+    # Instead there is NO catch-all: `training.weight_decay: 0.0` is the default every parameter
+    # falls through to, and only the 34 two-dimensional weight matrices (41.95M of the 42.04M) are
+    # listed explicitly.  Verified exhaustively: every `dim() >= 2` non-embedding tensor matches a
+    # rule and every LayerNorm / bias / embedding-like tensor matches none.
+    "in_proj_weight": 2.0e-3
+    "out_proj.weight": 2.0e-3
+    "linear1.weight": 2.0e-3
+    "linear2.weight": 2.0e-3
+    "weight_ih_l0": 2.0e-3
+    "weight_hh_l0": 2.0e-3
+    "h_in.weight": 2.0e-3
+    "tok_in.weight": 2.0e-3
+    "conf_in.weight": 2.0e-3
+    "delta_w1.weight": 2.0e-3
+    "delta_w2.weight": 2.0e-3
+    "err_seed_in.weight": 2.0e-3
+    "err_head.1.weight": 2.0e-3
+    "err_head.4.weight": 2.0e-3
+    # The cascade score head, listed for the same reason as err_head: only 2-D weight matrices are
+    # decayed, and every LayerNorm weight/bias, bias and the scalar `err_base_gain.gain` falls through
+    # to `training.weight_decay: 0.0`.  Over 500 steps at lr 5e-4 this shrinks the head by ~5e-4
+    # relative, so it is a consistency choice rather than a regulariser.
+    "err_score_head.0.weight": 2.0e-3
+    "err_score_head.2.weight": 2.0e-3
+
+  attention_backend: flex_attention
+  num_anchors: 512
+  # cloze's encoder runs H rows per block, so a chunk's activation peak is ~7x v2's:
+  # measured 9.28 GiB at BA=128, and the real chunk is BA = batch_size * 128 = 256.
+  # Halving the chunk halves that peak; total FLOPs are unchanged (this is only the
+  # gradient-checkpointing granularity).
+  objective_chunk_blocks: 64
+
+  # Backbone objective. The backbone is frozen, so this term produces no gradient; it is retained
+  # only because the lattice is read off `objective_logits` and its telemetry tracks whether the
+  # frozen feature stream is what stage-1 measured.
+  loss_type: dpace
+  dpace_alpha: 0.5
+  lk_loss_type: lambda
+  kl_scale: 1.0
+  kl_decay: 1.0
+
+  # Stage-1's 16-way covered-slot cross-entropy, kept after an 8-run architecture probe on the
+  # trace (scripts/probe_matrix.sh, scripts/probe_matrix2.sh) refuted every alternative:
+  #
+  #   A  v1 information flow, 16-way CE                +0.418   <- this config
+  #   E  A + committed-path rank fed to the GRU        +0.416
+  #   F  A + 0.5 * dense full-vocab auxiliary          +0.402
+  #   B  A + h_t wired into the corrector at 2560      +0.373
+  #   C  B + dense full-vocab CE                       +0.348
+  #   D  C without cross-slot attention                +0.325
+  #
+  # and, decisively, the gain-vs-data slopes do not cross: A gains +0.144 per doubling of anchors
+  # against C's +0.100, so A stays ahead at PerfectBlend scale rather than being overtaken.  The
+  # `full_vocab` objective remains implemented and gated (scripts/gate_pspr_v2_full_vocab.py) but is
+  # not what this run uses.
+  # profitable_repair, NOT a new objective: it already labels REPAIR iff the target is one of
+  # candidates 1..K-1, with KEEP for BOTH base-right slots and top-k misses
+  # (dflash_family_model.py:1035 `err_target = repair_is_covered`).  That is exactly the
+  # cascade's decision.  The historical `keep_repair` label instead calls a top-k miss REPAIR,
+  # which is unactionable -- no available repair can emit a target outside the lattice.
+  dflash2_selector_objective: profitable_repair
+  # Uniform coverage plus extra weight on the slot the metric is actually decided at.
+  #
+  # `uniform` (what v2 trained under) spends the same capacity on all 15 slots, but accept length
+  # truncates at ONE of them: the first the selector gets wrong.  `teacher_forced_frontier` is the
+  # opposite extreme and zeroes everything past that slot, which starves precisely the non-frontier
+  # representations a cloze row reads as context.  `uniform_frontier_boost` keeps the whole uniform
+  # signal and multiplies the current first error by (1 + boost), so no slot loses supervision.
+  # boost=0 is bit-identical to `uniform`.  At boost=3 the frontier carries ~22% of a block's
+  # selector weight against 6.7% under uniform.
+  # Unchanged from the champion so the weighting is not a second variable.
+  dflash2_selector_weight_mode: uniform_frontier_boost
+  dflash2_selector_frontier_boost: 3.0
+  dflash2_selector_loss_alpha: 1.0
+  # MUST be 0 for a factorised objective, and the host fail-closes on it
+  # (dflash_family_model.py:379).  profitable_repair's binary gate BCE is already a term of the MAIN
+  # likelihood (selector_ce = binary_ce + alt_ce), whereas the standalone err objective uses the
+  # historical label "is top-1 wrong", which calls a top-k miss REPAIR.  Running both would put two
+  # contradictory labels on the same logit.
+  dflash2_selector_err_loss_alpha: 0.0
+  # Must remain false: a local selector mean changes with rank/microbatch partitioning.
+  dflash2_selector_own_denominator: false
+  dflash2_selector_warmup_ratio: 0.0
+  dflash2_selector_ramp_ratio: 0.0
+  dflash2_selector_stop_gradient: false
+  dflash2_selector_target_greedy_labels: false
+
+  # Warm-started gate calibration: codex capped the first run at 500 steps, so save often enough
+  # to have several evaluable points inside that budget.
+  max_steps: 500
+  save_interval: 100
+  log_interval: 10
+  dist_timeout: 30
+  seed: 42
+
+tracking:
+  report_to: tensorboard
+
+runtime:
+  producer_lease: 8
+  producer_concurrency: 2
+  in_flight_high_watermark: 256
+  in_flight_low_watermark: 192
+
+run_id: qwen3-4b-pspr-cascade
+output_dir: ./outputs/qwen3-4b-pspr-cascade
+
+deployment:
+  mode: disaggregated
+  trainer:
+    nnodes: 1
+    nproc_per_node: 7
+  disaggregated:
+    control_dir: outputs/qwen3-4b-pspr-cascade/control
+    consumer_state_dir: outputs/qwen3-4b-pspr-cascade/consumer-state
+    backend: mooncake
+    managed_local:
+      trainer_cuda_visible_devices: ["1", "2", "3", "4", "5", "6", "7"]
+      mooncake:
+        protocol: tcp
+        global_segment_size_bytes: 34359738368
+        local_buffer_size_bytes: 2147483648
+      capture_servers:
+        - port: 30000
+          cuda_visible_devices: ["0"]
+          tp_size: 1
+          mem_fraction_static: 0.5
